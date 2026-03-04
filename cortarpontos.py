@@ -37,8 +37,17 @@ def ordenar_pontos(gdf):
     xmin, xmax = xs.min(), xs.max()
     ymin, ymax = ys.min(), ys.max()
 
-    xnorm = (xs - xmin) / (xmax - xmin)
-    ynorm = (ys - ymin) / (ymax - ymin)
+    dx = xmax - xmin
+    dy = ymax - ymin
+
+    if dx == 0:
+        dx = 1
+
+    if dy == 0:
+        dy = 1
+
+    xnorm = (xs - xmin) / dx
+    ynorm = (ys - ymin) / dy
 
     morton = (xnorm * 65535).astype(int) << 16 | (ynorm * 65535).astype(int)
 
@@ -71,7 +80,11 @@ def gerar_voronoi(gdf, limite):
     cells = []
 
     for c in vor.geoms:
-        cells.append(c.intersection(limite))
+
+        inter = c.intersection(limite)
+
+        if not inter.is_empty:
+            cells.append(inter)
 
     return cells
 
@@ -105,16 +118,26 @@ def gerar_kmz(poligono, pontos, caminho):
 
     kml = simplekml.Kml()
 
-    pol = kml.newpolygon()
+    if poligono.geom_type == "Polygon":
 
-    coords = [(x, y) for x, y in poligono.exterior.coords]
+        coords = [(x, y) for x, y in poligono.exterior.coords]
 
-    pol.outerboundaryis = coords
+        pol = kml.newpolygon()
+        pol.outerboundaryis = coords
 
+    elif poligono.geom_type == "MultiPolygon":
+
+        for part in poligono.geoms:
+
+            coords = [(x, y) for x, y in part.exterior.coords]
+
+            pol = kml.newpolygon()
+            pol.outerboundaryis = coords
+
+    # adicionar pontos
     for p in pontos.geometry:
 
         pt = kml.newpoint()
-
         pt.coords = [(p.x, p.y)]
 
     kml.savekmz(caminho)
@@ -127,32 +150,45 @@ def gerar_kmz(poligono, pontos, caminho):
 def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=None):
 
     pasta = workdir / "shape"
-
-    pasta.mkdir()
+    pasta.mkdir(exist_ok=True)
 
     shp = extrair_zip(zip_path, pasta)
 
     gdf = gpd.read_file(shp)
 
+    # garantir que sejam pontos
+    gdf = gdf[gdf.geometry.type.isin(["Point"])]
+
+    if len(gdf) == 0:
+        raise Exception("Shapefile não possui pontos válidos.")
+
+    # recorte municipal
     if mun_geom is not None:
 
         mun = gpd.GeoSeries([mun_geom], crs=mun_crs).to_crs(gdf.crs)[0]
 
         gdf = gdf[gdf.geometry.within(mun)]
 
+    if len(gdf) == 0:
+        raise Exception("Nenhum ponto dentro do município.")
+
+    # ordenar espacialmente
     gdf = ordenar_pontos(gdf)
 
+    # agrupar pranchas
     gdf = agrupar_pranchas(gdf, params["cap"])
 
+    # limite geral
     limite = unary_union(gdf.geometry).convex_hull
 
+    # voronoi
     cells = gerar_voronoi(gdf, limite)
 
+    # dissolver grupos
     grupos = dissolver_por_grupo(gdf, cells)
 
     saida = workdir / "resultado"
-
-    saida.mkdir()
+    saida.mkdir(exist_ok=True)
 
     for i, pol in enumerate(grupos):
 
@@ -162,6 +198,7 @@ def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=No
 
         gerar_kmz(pol, pts, kmz)
 
+    # zip final
     zip_saida = workdir / "resultado.zip"
 
     with zipfile.ZipFile(zip_saida, "w") as z:
