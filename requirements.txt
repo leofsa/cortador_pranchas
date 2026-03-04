@@ -1,7 +1,10 @@
 flask
+gunicorn
 geopandas
 pandas
-shapely
 numpy
 pyproj
+shapely
 simplekml
+openpyxl
+pyogrio
