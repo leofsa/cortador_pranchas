@@ -20,23 +20,37 @@ height:100vh;
 background:#1e293b;
 padding:40px;
 border-radius:10px;
-text-align:center;
-width:400px;
+width:500px;
 box-shadow:0 0 20px rgba(0,0,0,0.5);
 }
 
 h1{
 color:#38bdf8;
+text-align:center;
+}
+
+input, select{
+
+width:100%;
+padding:8px;
+margin-top:6px;
+margin-bottom:15px;
+border-radius:5px;
+border:none;
+
 }
 
 button{
+
 background:#38bdf8;
 border:none;
-padding:12px 25px;
+padding:12px;
+width:100%;
 color:white;
 font-size:16px;
 border-radius:5px;
 cursor:pointer;
+
 }
 
 button:hover{
@@ -53,16 +67,34 @@ background:#0284c7;
 
 <h1>🗺️ Cortador de Pranchas</h1>
 
-<p>Gerar Excel + KMZ automaticamente</p>
-
 <form action="/processar" method="post" enctype="multipart/form-data">
 
+<label>Shapefile</label>
 <input type="file" name="arquivo" required>
 
-<br><br>
+<label>Postes por prancha</label>
+<input type="number" name="cap" value="200">
+
+<label>Ícone escala</label>
+<input type="text" name="escala" value="0.7">
+
+<label>Linha pranchas</label>
+<input type="text" name="linha_prancha" value="3.5">
+
+<label>Linha município</label>
+<input type="text" name="linha_municipio" value="5.0">
+
+<label>Ícone URL</label>
+<input type="text" name="icone" value="http://maps.google.com/mapfiles/kml/paddle/wht-blank.png">
+
+<label>Curvas (m)</label>
+<input type="number" name="curvas" value="50">
+
+<label>Fix pontos (m)</label>
+<input type="number" name="fix" value="2">
 
 <button type="submit">
-Gerar Pranchas
+Gerar Excel + KMZ
 </button>
 
 </form>
