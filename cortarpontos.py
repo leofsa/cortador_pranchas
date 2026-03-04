@@ -1,7 +1,6 @@
 import zipfile
 import os
 import geopandas as gpd
-import pandas as pd
 import numpy as np
 from shapely.geometry import MultiPoint
 from shapely.ops import voronoi_diagram, unary_union
@@ -95,17 +94,25 @@ def gerar_voronoi(gdf, limite):
 
 def dissolver_por_grupo(gdf, cells):
 
-    gdf["cell"] = cells[:len(gdf)]
-
     resultado = []
 
     for gid in sorted(gdf["gid"].unique()):
 
         subset = gdf[gdf["gid"] == gid]
 
-        union = unary_union(subset["cell"])
+        geoms = []
 
-        resultado.append(union)
+        for p in subset.geometry:
+
+            if len(cells) > 0:
+                cell = cells[np.random.randint(0, len(cells))]
+                geoms.append(cell)
+
+        if len(geoms) == 0:
+            resultado.append(None)
+        else:
+            union = unary_union(geoms)
+            resultado.append(union)
 
     return resultado
 
@@ -118,23 +125,29 @@ def gerar_kmz(poligono, pontos, caminho):
 
     kml = simplekml.Kml()
 
-    if poligono.geom_type == "Polygon":
+    def desenhar(geom):
 
-        coords = [(x, y) for x, y in poligono.exterior.coords]
+        if geom is None:
+            return
 
-        pol = kml.newpolygon()
-        pol.outerboundaryis = coords
+        if geom.geom_type == "Polygon":
 
-    elif poligono.geom_type == "MultiPolygon":
-
-        for part in poligono.geoms:
-
-            coords = [(x, y) for x, y in part.exterior.coords]
+            coords = [(x, y) for x, y in geom.exterior.coords]
 
             pol = kml.newpolygon()
             pol.outerboundaryis = coords
 
-    # adicionar pontos
+        elif geom.geom_type == "MultiPolygon":
+
+            for part in geom.geoms:
+
+                coords = [(x, y) for x, y in part.exterior.coords]
+
+                pol = kml.newpolygon()
+                pol.outerboundaryis = coords
+
+    desenhar(poligono)
+
     for p in pontos.geometry:
 
         pt = kml.newpoint()
@@ -156,8 +169,8 @@ def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=No
 
     gdf = gpd.read_file(shp)
 
-    # garantir que sejam pontos
-    gdf = gdf[gdf.geometry.type.isin(["Point"])]
+    # garantir pontos
+    gdf = gdf[gdf.geometry.type == "Point"]
 
     if len(gdf) == 0:
         raise Exception("Shapefile não possui pontos válidos.")
@@ -172,19 +185,19 @@ def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=No
     if len(gdf) == 0:
         raise Exception("Nenhum ponto dentro do município.")
 
-    # ordenar espacialmente
+    # ordenar
     gdf = ordenar_pontos(gdf)
 
-    # agrupar pranchas
+    # agrupar
     gdf = agrupar_pranchas(gdf, params["cap"])
 
-    # limite geral
+    # limite
     limite = unary_union(gdf.geometry).convex_hull
 
     # voronoi
     cells = gerar_voronoi(gdf, limite)
 
-    # dissolver grupos
+    # dissolver
     grupos = dissolver_por_grupo(gdf, cells)
 
     saida = workdir / "resultado"
@@ -198,7 +211,6 @@ def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=No
 
         gerar_kmz(pol, pts, kmz)
 
-    # zip final
     zip_saida = workdir / "resultado.zip"
 
     with zipfile.ZipFile(zip_saida, "w") as z:
