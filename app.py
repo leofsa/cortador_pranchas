@@ -1,276 +1,39 @@
-import os
-import uuid
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import FileResponse
 import shutil
-import tempfile
-from pathlib import Path
+import uuid
+import os
 
-import geopandas as gpd
+from cortador import processar
 
-from flask import Flask, render_template, request, send_file, abort, jsonify
+app = FastAPI()
 
-from cortarpontos import processar_zip_shapefile
+UPLOAD = "uploads"
+OUTPUT = "outputs"
 
+os.makedirs(UPLOAD, exist_ok=True)
+os.makedirs(OUTPUT, exist_ok=True)
 
-# ============================================================
-# APP
-# ============================================================
-
-app = Flask(__name__)
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
-
-BASE_DIR = Path(__file__).parent
-
-# ⚠️ evitar acento no nome do arquivo
-MUNICIPIOS_PATH = BASE_DIR / "data" / "Municipios.geojson"
-
-
-# ============================================================
-# CARREGAR MUNICÍPIOS
-# ============================================================
-
-def carregar_municipios():
-
-    if not MUNICIPIOS_PATH.exists():
-        raise RuntimeError(f"Arquivo não encontrado: {MUNICIPIOS_PATH}")
-
-    gdf = gpd.read_file(MUNICIPIOS_PATH)
-
-    # garantir CRS
-    if gdf.crs is None:
-        gdf = gdf.set_crs(4674)
-
-    # garantir nomes corretos
-    if "SIGLA_UF" not in gdf.columns or "NM_MUN" not in gdf.columns:
-        raise RuntimeError(
-            "Base municipal precisa ter campos SIGLA_UF e NM_MUN"
-        )
-
-    return gdf
-
-
-municipios_gdf = carregar_municipios()
-
-
-# ============================================================
-# FUNÇÕES MUNICÍPIOS
-# ============================================================
-
-def listar_ufs():
-
-    return sorted(
-        municipios_gdf["SIGLA_UF"].unique()
-    )
-
-
-def listar_municipios(uf):
-
-    sub = municipios_gdf[
-        municipios_gdf["SIGLA_UF"] == uf
-    ]
-
-    return sorted(
-        sub["NM_MUN"].unique()
-    )
-
-
-def obter_municipio_geom(uf, nome):
-
-    sel = municipios_gdf[
-        (municipios_gdf["SIGLA_UF"] == uf) &
-        (municipios_gdf["NM_MUN"] == nome)
-    ]
-
-    if len(sel) == 0:
-        raise ValueError("Município não encontrado")
-
-    return sel.iloc[0].geometry, municipios_gdf.crs
-
-
-# ============================================================
-# ROTAS
-# ============================================================
-
-@app.get("/")
-def index():
-
-    try:
-
-        ufs = listar_ufs()
-
-        return render_template(
-            "index.html",
-            ufs=ufs
-        )
-
-    except Exception as e:
-
-        return f"<pre>Erro ao carregar municípios:\n{e}</pre>"
-
-
-# ------------------------------------------------------------
-# MUNICÍPIOS POR UF
-# ------------------------------------------------------------
-
-@app.get("/municipios/<uf>")
-def municipios(uf):
-
-    try:
-
-        lista = listar_municipios(uf)
-
-        return jsonify(lista)
-
-    except Exception as e:
-
-        return jsonify({"erro": str(e)}), 500
-
-
-# ------------------------------------------------------------
-# PROCESSAR SHAPEFILE
-# ------------------------------------------------------------
 
 @app.post("/processar")
-def processar():
+async def cortar(
+    file: UploadFile = File(...),
+    uf: str = Form(...),
+    municipio: str = Form(...),
+    cap: int = Form(...)
+):
 
-    if "arquivo" not in request.files:
-        abort(400, "Arquivo não enviado.")
+    uid = str(uuid.uuid4())
 
-    f = request.files["arquivo"]
+    shp_path = os.path.join(UPLOAD, uid + ".shp")
 
-    if not f or not f.filename:
-        abort(400, "Nenhum arquivo selecionado.")
+    with open(shp_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
 
-    filename = f.filename.lower()
+    out_dir = os.path.join(OUTPUT, uid)
 
-    if not filename.endswith(".zip"):
-        abort(
-            400,
-            "Envie um arquivo .ZIP contendo o shapefile completo (.shp, .shx, .dbf, .prj...)."
-        )
+    os.makedirs(out_dir)
 
-    # --------------------------------------------------------
-    # UF / MUNICÍPIO
-    # --------------------------------------------------------
+    zip_path = processar(shp_path, uf, municipio, cap, out_dir)
 
-    uf = request.form.get("uf")
-    municipio = request.form.get("municipio")
-
-    if not uf or not municipio:
-        abort(400, "Selecione UF e município.")
-
-    try:
-
-        mun_geom, mun_crs = obter_municipio_geom(
-            uf,
-            municipio
-        )
-
-    except Exception as e:
-
-        abort(400, str(e))
-
-    # --------------------------------------------------------
-    # PARÂMETROS
-    # --------------------------------------------------------
-
-    def get_float(name, default):
-
-        try:
-            return float(request.form.get(name, default))
-        except Exception:
-            return float(default)
-
-
-    def get_int(name, default):
-
-        try:
-            return int(request.form.get(name, default))
-        except Exception:
-            return int(default)
-
-
-    params = {
-
-        "cap": get_int("cap", 200),
-
-        "icon_scale": get_float("icon_scale", 0.7),
-
-        "line_cells": get_float("line_cells", 3.5),
-
-        "line_mun": get_float("line_mun", 5.0),
-
-        "icon_href": request.form.get(
-            "icon_href",
-            "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
-        ).strip(),
-
-        "smooth_m": get_float("smooth_m", 50),
-
-        "fix_buf": get_float("fix_buf", 2),
-    }
-
-    # --------------------------------------------------------
-    # WORKDIR TEMP
-    # --------------------------------------------------------
-
-    job_id = uuid.uuid4().hex[:12]
-
-    workdir = Path(
-        tempfile.mkdtemp(
-            prefix=f"cortador_{job_id}_"
-        )
-    )
-
-    try:
-
-        zip_path = workdir / "upload.zip"
-
-        f.save(zip_path)
-
-        # ----------------------------------------------------
-        # PROCESSAMENTO
-        # ----------------------------------------------------
-
-        out_zip = processar_zip_shapefile(
-            zip_path=zip_path,
-            params=params,
-            workdir=workdir,
-            mun_geom=mun_geom,
-            mun_crs=mun_crs
-        )
-
-        return send_file(
-            out_zip,
-            as_attachment=True,
-            download_name=f"resultado_{job_id}.zip",
-            mimetype="application/zip",
-        )
-
-    except Exception as e:
-
-        return f"<h2>Erro no processamento</h2><pre>{str(e)}</pre>", 500
-
-    finally:
-
-        try:
-            shutil.rmtree(workdir, ignore_errors=True)
-        except Exception:
-            pass
-
-
-# ============================================================
-# START
-# ============================================================
-
-if __name__ == "__main__":
-
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "10000"))
-    )
+    return FileResponse(zip_path, filename="resultado.zip")
