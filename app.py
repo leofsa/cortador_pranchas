@@ -2,7 +2,7 @@ from flask import Flask, render_template, request
 import subprocess
 import os
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder="templates")
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -31,3 +31,4 @@ def processar():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
