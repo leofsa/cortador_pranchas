@@ -11,7 +11,12 @@ from flask import Flask, render_template, request, send_file, abort, jsonify
 from cortarpontos import processar_zip_shapefile
 
 
+# ============================================================
+# APP
+# ============================================================
+
 app = Flask(__name__)
+
 
 # ============================================================
 # CONFIG
@@ -20,7 +25,9 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 BASE_DIR = Path(__file__).parent
-MUNICIPIOS_PATH = BASE_DIR / "data" / "Municípios.geojson"
+
+# ⚠️ evitar acento no nome do arquivo
+MUNICIPIOS_PATH = BASE_DIR / "data" / "Municipios.geojson"
 
 
 # ============================================================
@@ -34,11 +41,15 @@ def carregar_municipios():
 
     gdf = gpd.read_file(MUNICIPIOS_PATH)
 
+    # garantir CRS
     if gdf.crs is None:
         gdf = gdf.set_crs(4674)
 
+    # garantir nomes corretos
     if "SIGLA_UF" not in gdf.columns or "NM_MUN" not in gdf.columns:
-        raise RuntimeError("Base municipal precisa ter campos SIGLA_UF e NM_MUN")
+        raise RuntimeError(
+            "Base municipal precisa ter campos SIGLA_UF e NM_MUN"
+        )
 
     return gdf
 
@@ -47,16 +58,25 @@ municipios_gdf = carregar_municipios()
 
 
 # ============================================================
-# UTILITÁRIOS MUNICÍPIOS
+# FUNÇÕES MUNICÍPIOS
 # ============================================================
 
 def listar_ufs():
-    return sorted(municipios_gdf["SIGLA_UF"].unique())
+
+    return sorted(
+        municipios_gdf["SIGLA_UF"].unique()
+    )
 
 
 def listar_municipios(uf):
-    sub = municipios_gdf[municipios_gdf["SIGLA_UF"] == uf]
-    return sorted(sub["NM_MUN"].unique())
+
+    sub = municipios_gdf[
+        municipios_gdf["SIGLA_UF"] == uf
+    ]
+
+    return sorted(
+        sub["NM_MUN"].unique()
+    )
 
 
 def obter_municipio_geom(uf, nome):
@@ -79,31 +99,40 @@ def obter_municipio_geom(uf, nome):
 @app.get("/")
 def index():
 
-    ufs = listar_ufs()
+    try:
 
-    return render_template(
-        "index.html",
-        ufs=ufs
-    )
+        ufs = listar_ufs()
+
+        return render_template(
+            "index.html",
+            ufs=ufs
+        )
+
+    except Exception as e:
+
+        return f"<pre>Erro ao carregar municípios:\n{e}</pre>"
 
 
 # ------------------------------------------------------------
-# RETORNA MUNICÍPIOS DA UF
+# MUNICÍPIOS POR UF
 # ------------------------------------------------------------
 
 @app.get("/municipios/<uf>")
 def municipios(uf):
 
     try:
+
         lista = listar_municipios(uf)
+
         return jsonify(lista)
 
     except Exception as e:
+
         return jsonify({"erro": str(e)}), 500
 
 
 # ------------------------------------------------------------
-# PROCESSAMENTO
+# PROCESSAR SHAPEFILE
 # ------------------------------------------------------------
 
 @app.post("/processar")
@@ -120,7 +149,10 @@ def processar():
     filename = f.filename.lower()
 
     if not filename.endswith(".zip"):
-        abort(400, "Envie um arquivo .ZIP contendo o shapefile completo (.shp, .shx, .dbf, .prj...).")
+        abort(
+            400,
+            "Envie um arquivo .ZIP contendo o shapefile completo (.shp, .shx, .dbf, .prj...)."
+        )
 
     # --------------------------------------------------------
     # UF / MUNICÍPIO
@@ -133,8 +165,14 @@ def processar():
         abort(400, "Selecione UF e município.")
 
     try:
-        mun_geom, mun_crs = obter_municipio_geom(uf, municipio)
+
+        mun_geom, mun_crs = obter_municipio_geom(
+            uf,
+            municipio
+        )
+
     except Exception as e:
+
         abort(400, str(e))
 
     # --------------------------------------------------------
@@ -142,37 +180,52 @@ def processar():
     # --------------------------------------------------------
 
     def get_float(name, default):
+
         try:
             return float(request.form.get(name, default))
         except Exception:
             return float(default)
 
+
     def get_int(name, default):
+
         try:
             return int(request.form.get(name, default))
         except Exception:
             return int(default)
 
+
     params = {
+
         "cap": get_int("cap", 200),
+
         "icon_scale": get_float("icon_scale", 0.7),
+
         "line_cells": get_float("line_cells", 3.5),
+
         "line_mun": get_float("line_mun", 5.0),
+
         "icon_href": request.form.get(
             "icon_href",
             "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
         ).strip(),
+
         "smooth_m": get_float("smooth_m", 50),
+
         "fix_buf": get_float("fix_buf", 2),
     }
 
     # --------------------------------------------------------
-    # WORKDIR TEMPORÁRIO
+    # WORKDIR TEMP
     # --------------------------------------------------------
 
     job_id = uuid.uuid4().hex[:12]
 
-    workdir = Path(tempfile.mkdtemp(prefix=f"cortador_{job_id}_"))
+    workdir = Path(
+        tempfile.mkdtemp(
+            prefix=f"cortador_{job_id}_"
+        )
+    )
 
     try:
 
@@ -181,7 +234,7 @@ def processar():
         f.save(zip_path)
 
         # ----------------------------------------------------
-        # PROCESSAR
+        # PROCESSAMENTO
         # ----------------------------------------------------
 
         out_zip = processar_zip_shapefile(
@@ -216,6 +269,7 @@ def processar():
 # ============================================================
 
 if __name__ == "__main__":
+
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", "10000"))
