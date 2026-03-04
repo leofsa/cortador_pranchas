@@ -1,11 +1,26 @@
 import zipfile
 import os
-import geopandas as gpd
 import numpy as np
+import geopandas as gpd
 from shapely.geometry import MultiPoint
 from shapely.ops import voronoi_diagram, unary_union
-from pathlib import Path
+from shapely.geometry.base import BaseGeometry
 import simplekml
+
+
+# ============================================================
+# GEOMETRIA SEGURA
+# ============================================================
+
+def _is_geom(g):
+    return isinstance(g, BaseGeometry) and not g.is_empty
+
+
+def _safe_unary_union(geoms):
+    g = [x for x in geoms if _is_geom(x)]
+    if not g:
+        return None
+    return unary_union(g).buffer(0)
 
 
 # ============================================================
@@ -14,18 +29,18 @@ import simplekml
 
 def extrair_zip(zip_path, pasta):
 
-    with zipfile.ZipFile(zip_path, 'r') as z:
+    with zipfile.ZipFile(zip_path, "r") as z:
         z.extractall(pasta)
 
     for f in os.listdir(pasta):
         if f.lower().endswith(".shp"):
             return os.path.join(pasta, f)
 
-    raise Exception("Shapefile não encontrado dentro do ZIP")
+    raise Exception("Shapefile não encontrado no ZIP")
 
 
 # ============================================================
-# ORDENAR PONTOS ESPACIALMENTE
+# MORTON ORDER
 # ============================================================
 
 def ordenar_pontos(gdf):
@@ -36,54 +51,48 @@ def ordenar_pontos(gdf):
     xmin, xmax = xs.min(), xs.max()
     ymin, ymax = ys.min(), ys.max()
 
-    dx = xmax - xmin
-    dy = ymax - ymin
-
-    if dx == 0:
-        dx = 1
-
-    if dy == 0:
-        dy = 1
+    dx = xmax - xmin if xmax != xmin else 1
+    dy = ymax - ymin if ymax != ymin else 1
 
     xnorm = (xs - xmin) / dx
     ynorm = (ys - ymin) / dy
 
     morton = (xnorm * 65535).astype(int) << 16 | (ynorm * 65535).astype(int)
 
-    gdf["morton"] = morton
+    gdf["__morton"] = morton
 
-    return gdf.sort_values("morton").drop(columns=["morton"]).reset_index(drop=True)
+    return gdf.sort_values("__morton").drop(columns=["__morton"]).reset_index(drop=True)
 
 
 # ============================================================
-# AGRUPAR POR PRANCHA
+# AGRUPAMENTO
 # ============================================================
 
 def agrupar_pranchas(gdf, cap):
 
-    gdf["gid"] = np.arange(len(gdf)) // cap
+    gdf["__gid"] = np.arange(len(gdf)) // cap
 
     return gdf
 
 
 # ============================================================
-# GERAR POLÍGONOS VORONOI
+# GERAR PARTIÇÃO VORONOI
 # ============================================================
 
-def gerar_voronoi(gdf, limite):
+def gerar_poligonos(points, limite):
 
-    mp = MultiPoint(list(gdf.geometry))
+    mp = MultiPoint(list(points.geometry))
 
-    vor = voronoi_diagram(mp, envelope=limite)
+    vd = voronoi_diagram(mp, envelope=limite)
 
     cells = []
 
-    for c in vor.geoms:
+    for c in vd.geoms:
 
-        inter = c.intersection(limite)
+        p = c.intersection(limite)
 
-        if not inter.is_empty:
-            cells.append(inter)
+        if _is_geom(p):
+            cells.append(p)
 
     return cells
 
@@ -92,33 +101,33 @@ def gerar_voronoi(gdf, limite):
 # DISSOLVER POR GRUPO
 # ============================================================
 
-def dissolver_por_grupo(gdf, cells):
+def dissolver_por_grupo(points, cells):
 
     resultado = []
 
-    for gid in sorted(gdf["gid"].unique()):
+    for gid in sorted(points["__gid"].unique()):
 
-        subset = gdf[gdf["gid"] == gid]
+        subset = points[points["__gid"] == gid]
 
-        geoms = []
+        polys = []
 
         for p in subset.geometry:
 
-            if len(cells) > 0:
-                cell = cells[np.random.randint(0, len(cells))]
-                geoms.append(cell)
+            for c in cells:
 
-        if len(geoms) == 0:
-            resultado.append(None)
-        else:
-            union = unary_union(geoms)
-            resultado.append(union)
+                if c.covers(p):
+                    polys.append(c)
+                    break
+
+        poly = _safe_unary_union(polys)
+
+        resultado.append(poly)
 
     return resultado
 
 
 # ============================================================
-# GERAR KMZ
+# KMZ
 # ============================================================
 
 def gerar_kmz(poligono, pontos, caminho):
@@ -127,7 +136,7 @@ def gerar_kmz(poligono, pontos, caminho):
 
     def desenhar(geom):
 
-        if geom is None:
+        if not _is_geom(geom):
             return
 
         if geom.geom_type == "Polygon":
@@ -169,11 +178,10 @@ def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=No
 
     gdf = gpd.read_file(shp)
 
-    # garantir pontos
     gdf = gdf[gdf.geometry.type == "Point"]
 
     if len(gdf) == 0:
-        raise Exception("Shapefile não possui pontos válidos.")
+        raise Exception("Shapefile não possui pontos.")
 
     # recorte municipal
     if mun_geom is not None:
@@ -185,17 +193,17 @@ def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=No
     if len(gdf) == 0:
         raise Exception("Nenhum ponto dentro do município.")
 
-    # ordenar
+    # ordenar espacialmente
     gdf = ordenar_pontos(gdf)
 
     # agrupar
-    gdf = agrupar_pranchas(gdf, params["cap"])
+    cap = params["cap"]
+    gdf = agrupar_pranchas(gdf, cap)
 
-    # limite
     limite = unary_union(gdf.geometry).convex_hull
 
-    # voronoi
-    cells = gerar_voronoi(gdf, limite)
+    # gerar células
+    cells = gerar_poligonos(gdf, limite)
 
     # dissolver
     grupos = dissolver_por_grupo(gdf, cells)
@@ -205,12 +213,13 @@ def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=No
 
     for i, pol in enumerate(grupos):
 
-        pts = gdf[gdf["gid"] == i]
+        pts = gdf[gdf["__gid"] == i]
 
         kmz = saida / f"prancha_{i+1}.kmz"
 
         gerar_kmz(pol, pts, kmz)
 
+    # zip final
     zip_saida = workdir / "resultado.zip"
 
     with zipfile.ZipFile(zip_saida, "w") as z:
