@@ -1,11 +1,14 @@
 import zipfile
 import os
+import math
 import numpy as np
 import geopandas as gpd
-from shapely.geometry import MultiPoint
-from shapely.ops import voronoi_diagram, unary_union
-from shapely.geometry.base import BaseGeometry
+import pandas as pd
 import simplekml
+
+from shapely.geometry import MultiPoint
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union, voronoi_diagram
 
 
 # ============================================================
@@ -16,11 +19,11 @@ def _is_geom(g):
     return isinstance(g, BaseGeometry) and not g.is_empty
 
 
-def _safe_unary_union(geoms):
-    g = [x for x in geoms if _is_geom(x)]
-    if not g:
+def _safe_unary_union(iterable):
+    geoms = [g for g in iterable if _is_geom(g)]
+    if not geoms:
         return None
-    return unary_union(g).buffer(0)
+    return unary_union(geoms).buffer(0)
 
 
 # ============================================================
@@ -40,7 +43,7 @@ def extrair_zip(zip_path, pasta):
 
 
 # ============================================================
-# MORTON ORDER
+# MORTON ORDER (igual desktop)
 # ============================================================
 
 def ordenar_pontos(gdf):
@@ -65,7 +68,7 @@ def ordenar_pontos(gdf):
 
 
 # ============================================================
-# AGRUPAMENTO
+# AGRUPAMENTO FIXO
 # ============================================================
 
 def agrupar_pranchas(gdf, cap):
@@ -76,10 +79,63 @@ def agrupar_pranchas(gdf, cap):
 
 
 # ============================================================
-# GERAR PARTIÇÃO VORONOI
+# NORMALIZAR PARTIÇÃO
 # ============================================================
 
-def gerar_poligonos(points, limite):
+def normalize_partition(polys, boundary):
+
+    cleaned = []
+    union_prev = None
+
+    for p in polys:
+
+        if not _is_geom(p):
+            cleaned.append(None)
+            continue
+
+        p2 = p.intersection(boundary).buffer(0)
+
+        if union_prev is not None and _is_geom(union_prev):
+            p2 = p2.difference(union_prev).buffer(0)
+
+        cleaned.append(p2)
+
+        union_prev = p2 if union_prev is None else unary_union([union_prev, p2])
+
+    return cleaned
+
+
+# ============================================================
+# SUAVIZAR
+# ============================================================
+
+def smooth_polygons(polys, boundary, smooth):
+
+    if smooth <= 0:
+        return polys
+
+    sm = []
+
+    for p in polys:
+
+        if not _is_geom(p):
+            sm.append(None)
+            continue
+
+        p2 = p.buffer(smooth).buffer(-smooth)
+
+        p2 = p2.intersection(boundary).buffer(0)
+
+        sm.append(p2)
+
+    return normalize_partition(sm, boundary)
+
+
+# ============================================================
+# GERAR VORONOI
+# ============================================================
+
+def gerar_voronoi(points, limite):
 
     mp = MultiPoint(list(points.geometry))
 
@@ -89,41 +145,44 @@ def gerar_poligonos(points, limite):
 
     for c in vd.geoms:
 
-        p = c.intersection(limite)
+        cc = c.intersection(limite).buffer(0)
 
-        if _is_geom(p):
-            cells.append(p)
+        if _is_geom(cc):
+            cells.append(cc)
 
     return cells
 
 
 # ============================================================
-# DISSOLVER POR GRUPO
+# DISSOLVER
 # ============================================================
 
 def dissolver_por_grupo(points, cells):
 
-    resultado = []
+    gid_to_cells = {}
 
-    for gid in sorted(points["__gid"].unique()):
+    for _, r in points.iterrows():
 
-        subset = points[points["__gid"] == gid]
+        p = r.geometry
+        gid = int(r["__gid"])
 
-        polys = []
+        for c in cells:
 
-        for p in subset.geometry:
+            if c.covers(p):
+                gid_to_cells.setdefault(gid, []).append(c)
+                break
 
-            for c in cells:
+    n_groups = int(points["__gid"].max()) + 1
 
-                if c.covers(p):
-                    polys.append(c)
-                    break
+    dissolved = []
 
-        poly = _safe_unary_union(polys)
+    for gid in range(n_groups):
 
-        resultado.append(poly)
+        poly = _safe_unary_union(gid_to_cells.get(gid, []))
 
-    return resultado
+        dissolved.append(poly)
+
+    return dissolved
 
 
 # ============================================================
@@ -134,7 +193,7 @@ def gerar_kmz(poligono, pontos, caminho):
 
     kml = simplekml.Kml()
 
-    def desenhar(geom):
+    def draw(geom):
 
         if not _is_geom(geom):
             return
@@ -155,11 +214,12 @@ def gerar_kmz(poligono, pontos, caminho):
                 pol = kml.newpolygon()
                 pol.outerboundaryis = coords
 
-    desenhar(poligono)
+    draw(poligono)
 
     for p in pontos.geometry:
 
         pt = kml.newpoint()
+
         pt.coords = [(p.x, p.y)]
 
     kml.savekmz(caminho)
@@ -193,21 +253,29 @@ def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=No
     if len(gdf) == 0:
         raise Exception("Nenhum ponto dentro do município.")
 
-    # ordenar espacialmente
+    # ordenar
     gdf = ordenar_pontos(gdf)
 
     # agrupar
     cap = params["cap"]
+
     gdf = agrupar_pranchas(gdf, cap)
 
     limite = unary_union(gdf.geometry).convex_hull
 
-    # gerar células
-    cells = gerar_poligonos(gdf, limite)
+    # voronoi
+    cells = gerar_voronoi(gdf, limite)
 
-    # dissolver
+    # dissolve
     grupos = dissolver_por_grupo(gdf, cells)
 
+    # normalizar
+    grupos = normalize_partition(grupos, limite)
+
+    # suavizar
+    grupos = smooth_polygons(grupos, limite, params.get("smooth_m", 50))
+
+    # saída
     saida = workdir / "resultado"
     saida.mkdir(exist_ok=True)
 
@@ -219,7 +287,6 @@ def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=No
 
         gerar_kmz(pol, pts, kmz)
 
-    # zip final
     zip_saida = workdir / "resultado.zip"
 
     with zipfile.ZipFile(zip_saida, "w") as z:
