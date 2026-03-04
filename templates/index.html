@@ -1,105 +1,190 @@
 <!DOCTYPE html>
-<html>
+<html lang="pt-br">
 <head>
-
-<title>Cortador de Pranchas</title>
-
-<style>
-
-body{
-background:#0f172a;
-font-family:Arial;
-color:white;
-display:flex;
-justify-content:center;
-align-items:center;
-height:100vh;
-}
-
-.container{
-background:#1e293b;
-padding:40px;
-border-radius:10px;
-width:500px;
-box-shadow:0 0 20px rgba(0,0,0,0.5);
-}
-
-h1{
-color:#38bdf8;
-text-align:center;
-}
-
-input, select{
-
-width:100%;
-padding:8px;
-margin-top:6px;
-margin-bottom:15px;
-border-radius:5px;
-border:none;
-
-}
-
-button{
-
-background:#38bdf8;
-border:none;
-padding:12px;
-width:100%;
-color:white;
-font-size:16px;
-border-radius:5px;
-cursor:pointer;
-
-}
-
-button:hover{
-background:#0284c7;
-}
-
-</style>
-
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Cortador de Pranchas</title>
+  <style>
+    body{
+      margin:0;
+      font-family: Arial, sans-serif;
+      background: radial-gradient(circle at top, #0b1324, #050814);
+      color:#fff;
+      min-height:100vh;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:24px;
+    }
+    .card{
+      width:min(820px, 100%);
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius:18px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      padding:28px;
+      backdrop-filter: blur(8px);
+    }
+    .title{
+      display:flex;
+      align-items:center;
+      gap:12px;
+      margin:0 0 6px 0;
+      font-size:34px;
+      color:#38bdf8;
+      font-weight:800;
+      letter-spacing:0.2px;
+    }
+    .subtitle{
+      margin:0 0 18px 0;
+      opacity:0.9;
+      font-size:14px;
+      line-height:1.4;
+    }
+    .grid{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:14px;
+      margin-top:14px;
+    }
+    label{
+      display:block;
+      font-size:13px;
+      margin-bottom:6px;
+      opacity:0.95;
+    }
+    input{
+      width:100%;
+      box-sizing:border-box;
+      padding:12px 12px;
+      border-radius:10px;
+      border:1px solid rgba(255,255,255,0.14);
+      background: rgba(0,0,0,0.25);
+      color:#fff;
+      outline:none;
+    }
+    input[type="file"]{
+      padding:10px;
+      background: rgba(0,0,0,0.25);
+    }
+    .full{
+      grid-column: 1 / -1;
+    }
+    .note{
+      margin-top:10px;
+      font-size:13px;
+      opacity:0.85;
+      background: rgba(255,255,255,0.06);
+      border:1px solid rgba(255,255,255,0.10);
+      border-radius:12px;
+      padding:12px 12px;
+    }
+    .btn{
+      margin-top:18px;
+      width:100%;
+      padding:14px 14px;
+      border:none;
+      border-radius:12px;
+      background:#38bdf8;
+      color:#001018;
+      font-weight:800;
+      font-size:16px;
+      cursor:pointer;
+      transition: transform .04s ease, opacity .2s ease;
+    }
+    .btn:active{ transform: scale(0.99); }
+    .btn:disabled{
+      opacity:0.6;
+      cursor:not-allowed;
+    }
+    .row{
+      display:flex;
+      gap:10px;
+      align-items:center;
+      justify-content:space-between;
+    }
+    .small{
+      font-size:12px;
+      opacity:0.75;
+    }
+    .loading{
+      display:none;
+      margin-top:10px;
+      font-size:13px;
+      opacity:0.9;
+    }
+  </style>
 </head>
-
 <body>
+  <div class="card">
+    <h1 class="title">🗺️ Cortador de Pranchas</h1>
+    <p class="subtitle">
+      Envie <b>um ZIP</b> com o shapefile completo (<code>.shp + .shx + .dbf + .prj</code>).
+      Ao clicar em <b>Gerar</b>, o sistema vai processar e baixar um <b>resultado.zip</b> com Excel + KMZs.
+    </p>
 
-<div class="container">
+    <form id="form" action="/processar" method="post" enctype="multipart/form-data">
+      <div class="grid">
+        <div class="full">
+          <label>Shapefile (ZIP)</label>
+          <input type="file" name="arquivo" accept=".zip" required />
+          <div class="small">⚠️ Se enviar só .shp, dá erro. Tem que ser ZIP com todos os arquivos.</div>
+        </div>
 
-<h1>🗺️ Cortador de Pranchas</h1>
+        <div>
+          <label>Postes por prancha</label>
+          <input name="cap" type="number" value="200" min="1" required />
+        </div>
 
-<form action="/processar" method="post" enctype="multipart/form-data">
+        <div>
+          <label>Ícone escala</label>
+          <input name="icon_scale" type="number" step="0.1" value="0.7" required />
+        </div>
 
-<label>Shapefile</label>
-<input type="file" name="arquivo" required>
+        <div>
+          <label>Linha pranchas</label>
+          <input name="line_cells" type="number" step="0.1" value="3.5" required />
+        </div>
 
-<label>Postes por prancha</label>
-<input type="number" name="cap" value="200">
+        <div>
+          <label>Linha município</label>
+          <input name="line_mun" type="number" step="0.1" value="5.0" required />
+        </div>
 
-<label>Ícone escala</label>
-<input type="text" name="escala" value="0.7">
+        <div class="full">
+          <label>Ícone URL</label>
+          <input name="icon_href" type="text" value="http://maps.google.com/mapfiles/kml/paddle/wht-blank.png" />
+        </div>
 
-<label>Linha pranchas</label>
-<input type="text" name="linha_prancha" value="3.5">
+        <div>
+          <label>Curvas (m)</label>
+          <input name="smooth_m" type="number" step="1" value="50" />
+        </div>
 
-<label>Linha município</label>
-<input type="text" name="linha_municipio" value="5.0">
+        <div>
+          <label>Fix pontos (m)</label>
+          <input name="fix_buf" type="number" step="0.5" value="2" />
+        </div>
+      </div>
 
-<label>Ícone URL</label>
-<input type="text" name="icone" value="http://maps.google.com/mapfiles/kml/paddle/wht-blank.png">
+      <div class="note">
+        ✅ Saída: <b>Excel</b> (1 aba por prancha) + <b>KMZ</b> (1 por prancha) dentro de <b>resultado.zip</b>.
+      </div>
 
-<label>Curvas (m)</label>
-<input type="number" name="curvas" value="50">
+      <button class="btn" id="btn" type="submit">Gerar Excel + KMZ</button>
+      <div class="loading" id="loading">⏳ Processando… aguarde. Quando finalizar, o download vai iniciar automaticamente.</div>
+    </form>
+  </div>
 
-<label>Fix pontos (m)</label>
-<input type="number" name="fix" value="2">
+  <script>
+    const form = document.getElementById("form");
+    const btn = document.getElementById("btn");
+    const loading = document.getElementById("loading");
 
-<button type="submit">
-Gerar Excel + KMZ
-</button>
-
-</form>
-
-</div>
-
+    form.addEventListener("submit", () => {
+      btn.disabled = true;
+      loading.style.display = "block";
+    });
+  </script>
 </body>
 </html>
