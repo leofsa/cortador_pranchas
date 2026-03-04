@@ -1,275 +1,173 @@
-import os
 import zipfile
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
+import os
 import geopandas as gpd
+import pandas as pd
+import numpy as np
+from shapely.geometry import MultiPoint
+from shapely.ops import voronoi_diagram, unary_union
+from pathlib import Path
 import simplekml
 
-from shapely.geometry import MultiPoint
-from shapely.ops import voronoi_diagram
+
+# ============================================================
+# EXTRAIR ZIP
+# ============================================================
+
+def extrair_zip(zip_path, pasta):
+
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        z.extractall(pasta)
+
+    for f in os.listdir(pasta):
+        if f.lower().endswith(".shp"):
+            return os.path.join(pasta, f)
+
+    raise Exception("Shapefile não encontrado dentro do ZIP")
 
 
-def _find_first_shp(folder: Path) -> Path:
-    shps = sorted(folder.rglob("*.shp"))
-    if not shps:
-        raise FileNotFoundError("Não encontrei nenhum .shp dentro do ZIP.")
-    return shps[0]
+# ============================================================
+# ORDENAR PONTOS ESPACIALMENTE
+# ============================================================
 
+def ordenar_pontos(gdf):
 
-def _validate_shapefile_set(shp_path: Path):
-
-    base = shp_path.with_suffix("")
-
-    needed = [".shp", ".shx", ".dbf"]
-
-    missing = []
-
-    for ext in needed:
-        if not (base.with_suffix(ext)).exists():
-            missing.append(ext)
-
-    if missing:
-        raise FileNotFoundError(
-            f"Shapefile incompleto. Faltando: {', '.join(missing)}"
-        )
-
-
-def _sort_by_spatial_morton(gdf: gpd.GeoDataFrame):
-
-    xs = gdf.geometry.x.to_numpy()
-    ys = gdf.geometry.y.to_numpy()
+    xs = gdf.geometry.x.values
+    ys = gdf.geometry.y.values
 
     xmin, xmax = xs.min(), xs.max()
     ymin, ymax = ys.min(), ys.max()
 
-    dx = xmax - xmin if xmax != xmin else 1
-    dy = ymax - ymin if ymax != ymin else 1
+    xnorm = (xs - xmin) / (xmax - xmin)
+    ynorm = (ys - ymin) / (ymax - ymin)
 
-    x_norm = (xs - xmin) / dx
-    y_norm = (ys - ymin) / dy
+    morton = (xnorm * 65535).astype(int) << 16 | (ynorm * 65535).astype(int)
 
-    x16 = (x_norm * 65535).astype(np.uint32)
-    y16 = (y_norm * 65535).astype(np.uint32)
+    gdf["morton"] = morton
 
-    def part1by1(n):
-        n = (n | (n << 8)) & 0x00FF00FF
-        n = (n | (n << 4)) & 0x0F0F0F0F
-        n = (n | (n << 2)) & 0x33333333
-        n = (n | (n << 1)) & 0x55555555
-        return n
-
-    morton = part1by1(x16) | (part1by1(y16) << 1)
-
-    g = gdf.copy()
-    g["__morton"] = morton
-
-    g = g.sort_values("__morton").drop(columns="__morton").reset_index(drop=True)
-
-    return g
+    return gdf.sort_values("morton").drop(columns=["morton"]).reset_index(drop=True)
 
 
-def _format_prancha(i):
-    return f"Prancha {i:02d}"
+# ============================================================
+# AGRUPAR POR PRANCHA
+# ============================================================
+
+def agrupar_pranchas(gdf, cap):
+
+    gdf["gid"] = np.arange(len(gdf)) // cap
+
+    return gdf
 
 
-def _write_excel(points, out_xlsx):
+# ============================================================
+# GERAR POLÍGONOS VORONOI
+# ============================================================
 
-    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+def gerar_voronoi(gdf, limite):
 
-        n = int(points["__gid"].max()) + 1
+    mp = MultiPoint(list(gdf.geometry))
 
-        for gid in range(n):
+    vor = voronoi_diagram(mp, envelope=limite)
 
-            sheet = _format_prancha(gid + 1)
+    cells = []
 
-            g = points[points["__gid"] == gid].copy()
+    for c in vor.geoms:
+        cells.append(c.intersection(limite))
 
-            df = g.drop(columns="geometry")
-
-            df["lon"] = g.geometry.x
-            df["lat"] = g.geometry.y
-
-            df.to_excel(writer, sheet_name=sheet[:31], index=False)
+    return cells
 
 
-def _kml_color(a, r, g, b):
-    return f"{a:02x}{b:02x}{g:02x}{r:02x}"
+# ============================================================
+# DISSOLVER POR GRUPO
+# ============================================================
+
+def dissolver_por_grupo(gdf, cells):
+
+    gdf["cell"] = cells[:len(gdf)]
+
+    resultado = []
+
+    for gid in sorted(gdf["gid"].unique()):
+
+        subset = gdf[gdf["gid"] == gid]
+
+        union = unary_union(subset["cell"])
+
+        resultado.append(union)
+
+    return resultado
 
 
-# ------------------------------------------------------------
-# CORTE MUNICIPAL
-# ------------------------------------------------------------
+# ============================================================
+# GERAR KMZ
+# ============================================================
 
-def _clip_points_to_municipio(points, mun_geom, mun_crs):
-
-    mun_geom_proj = gpd.GeoSeries([mun_geom], crs=mun_crs).to_crs(points.crs).iloc[0]
-
-    mask = points.geometry.within(mun_geom_proj) | points.geometry.touches(mun_geom_proj)
-
-    return points.loc[mask].copy(), mun_geom_proj
-
-
-# ------------------------------------------------------------
-# VORONOI
-# ------------------------------------------------------------
-
-def _build_polygons_voronoi(points, boundary):
-
-    mp = MultiPoint(list(points.geometry))
-
-    vor = voronoi_diagram(mp, envelope=boundary)
-
-    cells = list(vor.geoms)
-
-    gdf_cells = gpd.GeoDataFrame(geometry=cells, crs=points.crs)
-
-    join = gpd.sjoin(points, gdf_cells, predicate="within")
-
-    gdf_cells["__gid"] = join["__gid"].values
-
-    polys = gdf_cells.dissolve(by="__gid")
-
-    return polys
-
-
-def _smooth_polygon(poly):
-
-    try:
-        return poly.buffer(30).buffer(-30)
-    except:
-        return poly
-
-
-def _write_kmz_for_group(points, polygon, municipio, out_kmz, icon_href, icon_scale, line_width):
+def gerar_kmz(poligono, pontos, caminho):
 
     kml = simplekml.Kml()
 
-    fol = kml.newfolder(name="")
+    pol = kml.newpolygon()
 
-    icon_style = simplekml.Style()
+    coords = [(x, y) for x, y in poligono.exterior.coords]
 
-    icon_style.iconstyle.icon.href = icon_href
-    icon_style.iconstyle.scale = icon_scale
-    icon_style.iconstyle.color = _kml_color(255, 0, 0, 255)
+    pol.outerboundaryis = coords
 
-    icon_style.labelstyle.scale = 0
+    for p in pontos.geometry:
 
-    if polygon is not None:
+        pt = kml.newpoint()
 
-        polygon = _smooth_polygon(polygon)
+        pt.coords = [(p.x, p.y)]
 
-        polygon = polygon.intersection(municipio)
-
-        if polygon.geom_type == "Polygon":
-
-            pol = fol.newpolygon(name="")
-
-            pol.outerboundaryis = list(polygon.exterior.coords)
-
-            pol.polystyle.fill = 0
-
-            pol.linestyle.width = line_width
-
-            pol.linestyle.color = _kml_color(255, 255, 255, 0)
-
-    for _, row in points.iterrows():
-
-        p = fol.newpoint()
-
-        p.coords = [(row.geometry.x, row.geometry.y)]
-
-        p.style = icon_style
-
-    kml.savekmz(out_kmz)
+    kml.savekmz(caminho)
 
 
-# ------------------------------------------------------------
+# ============================================================
 # PROCESSAMENTO PRINCIPAL
-# ------------------------------------------------------------
+# ============================================================
 
-def processar_zip_shapefile(zip_path: Path, params: dict, workdir: Path, mun_geom, mun_crs):
+def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=None):
 
-    extract_dir = workdir / "input"
-    out_dir = workdir / "output"
-    kmz_dir = out_dir / "KMZ"
+    pasta = workdir / "shape"
 
-    extract_dir.mkdir(parents=True, exist_ok=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    kmz_dir.mkdir(parents=True, exist_ok=True)
+    pasta.mkdir()
 
-    with zipfile.ZipFile(zip_path) as z:
-        z.extractall(extract_dir)
+    shp = extrair_zip(zip_path, pasta)
 
-    shp_path = _find_first_shp(extract_dir)
+    gdf = gpd.read_file(shp)
 
-    _validate_shapefile_set(shp_path)
+    if mun_geom is not None:
 
-    cap = int(params.get("cap", 200))
-    icon_scale = float(params.get("icon_scale", 0.7))
-    line_cells = float(params.get("line_cells", 3.5))
+        mun = gpd.GeoSeries([mun_geom], crs=mun_crs).to_crs(gdf.crs)[0]
 
-    icon_href = params.get(
-        "icon_href",
-        "http://maps.google.com/mapfiles/kml/paddle/wht-blank.png"
-    )
+        gdf = gdf[gdf.geometry.within(mun)]
 
-    gdf = gpd.read_file(shp_path)
+    gdf = ordenar_pontos(gdf)
 
-    if gdf.crs is None:
-        raise ValueError("Shapefile sem CRS")
+    gdf = agrupar_pranchas(gdf, params["cap"])
 
-    # --------------------------------------------------------
-    # RECORTE MUNICIPAL
-    # --------------------------------------------------------
+    limite = unary_union(gdf.geometry).convex_hull
 
-    gdf, municipio_proj = _clip_points_to_municipio(gdf, mun_geom, mun_crs)
+    cells = gerar_voronoi(gdf, limite)
 
-    if len(gdf) == 0:
-        raise ValueError("Nenhum ponto dentro do município selecionado")
+    grupos = dissolver_por_grupo(gdf, cells)
 
-    # --------------------------------------------------------
+    saida = workdir / "resultado"
 
-    pts = gdf.to_crs(4326)
+    saida.mkdir()
 
-    pts = _sort_by_spatial_morton(pts)
+    for i, pol in enumerate(grupos):
 
-    pts["__gid"] = (np.arange(len(pts)) // cap).astype(int)
+        pts = gdf[gdf["gid"] == i]
 
-    excel_path = out_dir / "pranchas.xlsx"
+        kmz = saida / f"prancha_{i+1}.kmz"
 
-    _write_excel(pts, excel_path)
+        gerar_kmz(pol, pts, kmz)
 
-    polys = _build_polygons_voronoi(pts, municipio_proj)
+    zip_saida = workdir / "resultado.zip"
 
-    n_groups = int(pts["__gid"].max()) + 1
+    with zipfile.ZipFile(zip_saida, "w") as z:
 
-    for gid in range(n_groups):
+        for f in os.listdir(saida):
 
-        grp = pts[pts["__gid"] == gid]
+            z.write(saida / f, f)
 
-        poly = polys.loc[gid].geometry if gid in polys.index else None
-
-        kmz_path = kmz_dir / f"{_format_prancha(gid+1).replace(' ','_')}.kmz"
-
-        _write_kmz_for_group(
-            grp,
-            poly,
-            municipio_proj,
-            kmz_path,
-            icon_href,
-            icon_scale,
-            line_cells
-        )
-
-    result_zip = workdir / "resultado.zip"
-
-    with zipfile.ZipFile(result_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
-
-        z.write(excel_path, "pranchas.xlsx")
-
-        for kmz in kmz_dir.glob("*.kmz"):
-            z.write(kmz, f"KMZ/{kmz.name}")
-
-    return result_zip
+    return zip_saida
