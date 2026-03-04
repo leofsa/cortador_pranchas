@@ -1,298 +1,226 @@
-import zipfile
 import os
 import math
-import numpy as np
+import zipfile
 import geopandas as gpd
 import pandas as pd
+import numpy as np
 import simplekml
 
 from shapely.geometry import MultiPoint
-from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union, voronoi_diagram
+from pyproj import CRS
 
 
-# ============================================================
-# GEOMETRIA SEGURA
-# ============================================================
+# ---------------------------------------------------
+# helpers
+# ---------------------------------------------------
 
 def _is_geom(g):
-    return isinstance(g, BaseGeometry) and not g.is_empty
+    return g is not None and not g.is_empty
 
 
-def _safe_unary_union(iterable):
-    geoms = [g for g in iterable if _is_geom(g)]
+def _safe_unary_union(geoms):
+    geoms = [g for g in geoms if _is_geom(g)]
     if not geoms:
         return None
     return unary_union(geoms).buffer(0)
 
 
-# ============================================================
-# EXTRAIR ZIP
-# ============================================================
+# ---------------------------------------------------
+# carregar municípios
+# ---------------------------------------------------
 
-def extrair_zip(zip_path, pasta):
+def load_municipios():
 
-    with zipfile.ZipFile(zip_path, "r") as z:
-        z.extractall(pasta)
+    shp = "data/municipios.shp"
 
-    for f in os.listdir(pasta):
-        if f.lower().endswith(".shp"):
-            return os.path.join(pasta, f)
+    mun = gpd.read_file(shp)
 
-    raise Exception("Shapefile não encontrado no ZIP")
+    if mun.crs is None:
+        mun = mun.set_crs(4674)
 
-
-# ============================================================
-# MORTON ORDER (igual desktop)
-# ============================================================
-
-def ordenar_pontos(gdf):
-
-    xs = gdf.geometry.x.values
-    ys = gdf.geometry.y.values
-
-    xmin, xmax = xs.min(), xs.max()
-    ymin, ymax = ys.min(), ys.max()
-
-    dx = xmax - xmin if xmax != xmin else 1
-    dy = ymax - ymin if ymax != ymin else 1
-
-    xnorm = (xs - xmin) / dx
-    ynorm = (ys - ymin) / dy
-
-    morton = (xnorm * 65535).astype(int) << 16 | (ynorm * 65535).astype(int)
-
-    gdf["__morton"] = morton
-
-    return gdf.sort_values("__morton").drop(columns=["__morton"]).reset_index(drop=True)
+    return mun
 
 
-# ============================================================
-# AGRUPAMENTO FIXO
-# ============================================================
+# ---------------------------------------------------
+# guess UTM
+# ---------------------------------------------------
 
-def agrupar_pranchas(gdf, cap):
+def guess_utm(gdf):
 
-    gdf["__gid"] = np.arange(len(gdf)) // cap
+    g = gdf.to_crs(4326)
 
-    return gdf
+    centroid = g.unary_union.centroid
 
+    lon = centroid.x
+    lat = centroid.y
 
-# ============================================================
-# NORMALIZAR PARTIÇÃO
-# ============================================================
+    zone = int((lon + 180) // 6) + 1
 
-def normalize_partition(polys, boundary):
+    epsg = 32700 + zone if lat < 0 else 32600 + zone
 
-    cleaned = []
-    union_prev = None
-
-    for p in polys:
-
-        if not _is_geom(p):
-            cleaned.append(None)
-            continue
-
-        p2 = p.intersection(boundary).buffer(0)
-
-        if union_prev is not None and _is_geom(union_prev):
-            p2 = p2.difference(union_prev).buffer(0)
-
-        cleaned.append(p2)
-
-        union_prev = p2 if union_prev is None else unary_union([union_prev, p2])
-
-    return cleaned
+    return CRS.from_epsg(epsg)
 
 
-# ============================================================
-# SUAVIZAR
-# ============================================================
+# ---------------------------------------------------
+# ordenar spatial
+# ---------------------------------------------------
 
-def smooth_polygons(polys, boundary, smooth):
+def spatial_sort(gdf):
 
-    if smooth <= 0:
-        return polys
+    g = gdf.copy()
 
-    sm = []
+    g["x"] = g.geometry.x
+    g["y"] = g.geometry.y
 
-    for p in polys:
+    g = g.sort_values(["x", "y"])
 
-        if not _is_geom(p):
-            sm.append(None)
-            continue
+    g = g.reset_index(drop=True)
 
-        p2 = p.buffer(smooth).buffer(-smooth)
-
-        p2 = p2.intersection(boundary).buffer(0)
-
-        sm.append(p2)
-
-    return normalize_partition(sm, boundary)
+    return g.drop(columns=["x", "y"])
 
 
-# ============================================================
-# GERAR VORONOI
-# ============================================================
+# ---------------------------------------------------
+# grupos fixos
+# ---------------------------------------------------
 
-def gerar_voronoi(points, limite):
+def assign_groups(gdf, cap):
+
+    g = gdf.copy()
+
+    g["__gid"] = np.arange(len(g)) // cap
+
+    return g
+
+
+# ---------------------------------------------------
+# criar partições
+# ---------------------------------------------------
+
+def build_cells(points, boundary):
 
     mp = MultiPoint(list(points.geometry))
 
-    vd = voronoi_diagram(mp, envelope=limite)
+    vd = voronoi_diagram(mp, envelope=boundary)
 
     cells = []
 
     for c in vd.geoms:
 
-        cc = c.intersection(limite).buffer(0)
+        c = c.intersection(boundary)
 
-        if _is_geom(cc):
-            cells.append(cc)
+        if _is_geom(c):
+            cells.append(c)
 
     return cells
 
 
-# ============================================================
-# DISSOLVER
-# ============================================================
+# ---------------------------------------------------
+# export excel
+# ---------------------------------------------------
 
-def dissolver_por_grupo(points, cells):
+def export_excel(points, out):
 
-    gid_to_cells = {}
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
 
-    for _, r in points.iterrows():
+        n = points["__gid"].max() + 1
 
-        p = r.geometry
-        gid = int(r["__gid"])
+        for gid in range(n):
 
-        for c in cells:
+            g = points[points["__gid"] == gid]
 
-            if c.covers(p):
-                gid_to_cells.setdefault(gid, []).append(c)
-                break
+            df = g.drop(columns="geometry")
 
-    n_groups = int(points["__gid"].max()) + 1
+            df["lon"] = g.geometry.x
+            df["lat"] = g.geometry.y
 
-    dissolved = []
-
-    for gid in range(n_groups):
-
-        poly = _safe_unary_union(gid_to_cells.get(gid, []))
-
-        dissolved.append(poly)
-
-    return dissolved
+            df.to_excel(writer, sheet_name=f"Prancha {gid+1}")
 
 
-# ============================================================
-# KMZ
-# ============================================================
+# ---------------------------------------------------
+# export kmz
+# ---------------------------------------------------
 
-def gerar_kmz(poligono, pontos, caminho):
+def export_kmz(points, cell, municipio, path):
 
     kml = simplekml.Kml()
 
-    def draw(geom):
+    fol = kml.newfolder()
 
-        if not _is_geom(geom):
-            return
+    for _, r in points.iterrows():
 
-        if geom.geom_type == "Polygon":
+        p = fol.newpoint()
 
-            coords = [(x, y) for x, y in geom.exterior.coords]
+        p.coords = [(r.geometry.x, r.geometry.y)]
 
-            pol = kml.newpolygon()
-            pol.outerboundaryis = coords
+    if cell:
 
-        elif geom.geom_type == "MultiPolygon":
+        pol = fol.newpolygon()
 
-            for part in geom.geoms:
+        pol.outerboundaryis = list(cell.exterior.coords)
 
-                coords = [(x, y) for x, y in part.exterior.coords]
+    pol = fol.newpolygon()
 
-                pol = kml.newpolygon()
-                pol.outerboundaryis = coords
+    pol.outerboundaryis = list(municipio.exterior.coords)
 
-    draw(poligono)
-
-    for p in pontos.geometry:
-
-        pt = kml.newpoint()
-
-        pt.coords = [(p.x, p.y)]
-
-    kml.savekmz(caminho)
+    kml.savekmz(path)
 
 
-# ============================================================
-# PROCESSAMENTO PRINCIPAL
-# ============================================================
+# ---------------------------------------------------
+# pipeline principal
+# ---------------------------------------------------
 
-def processar_zip_shapefile(zip_path, params, workdir, mun_geom=None, mun_crs=None):
+def processar(shp_path, uf, municipio, cap, out_dir):
 
-    pasta = workdir / "shape"
-    pasta.mkdir(exist_ok=True)
+    mun = load_municipios()
 
-    shp = extrair_zip(zip_path, pasta)
+    gdf = gpd.read_file(shp_path)
 
-    gdf = gpd.read_file(shp)
+    mun_geom = mun[(mun["SIGLA_UF"] == uf) & (mun["NM_MUN"] == municipio)].geometry.iloc[0]
 
-    gdf = gdf[gdf.geometry.type == "Point"]
+    gdf = gdf[gdf.geometry.within(mun_geom)]
 
-    if len(gdf) == 0:
-        raise Exception("Shapefile não possui pontos.")
+    utm = guess_utm(gdf)
 
-    # recorte municipal
-    if mun_geom is not None:
+    gdf = gdf.to_crs(utm)
 
-        mun = gpd.GeoSeries([mun_geom], crs=mun_crs).to_crs(gdf.crs)[0]
+    mun_geom = gpd.GeoSeries([mun_geom], crs=mun.crs).to_crs(utm).iloc[0]
 
-        gdf = gdf[gdf.geometry.within(mun)]
+    gdf = spatial_sort(gdf)
 
-    if len(gdf) == 0:
-        raise Exception("Nenhum ponto dentro do município.")
+    gdf = assign_groups(gdf, cap)
 
-    # ordenar
-    gdf = ordenar_pontos(gdf)
+    cells = build_cells(gdf, mun_geom)
 
-    # agrupar
-    cap = params["cap"]
+    gdf_wgs = gdf.to_crs(4326)
 
-    gdf = agrupar_pranchas(gdf, cap)
+    excel = os.path.join(out_dir, "pranchas.xlsx")
 
-    limite = unary_union(gdf.geometry).convex_hull
+    export_excel(gdf_wgs, excel)
 
-    # voronoi
-    cells = gerar_voronoi(gdf, limite)
+    kmz_dir = os.path.join(out_dir, "kmz")
 
-    # dissolve
-    grupos = dissolver_por_grupo(gdf, cells)
+    os.makedirs(kmz_dir, exist_ok=True)
 
-    # normalizar
-    grupos = normalize_partition(grupos, limite)
+    n = gdf["__gid"].max() + 1
 
-    # suavizar
-    grupos = smooth_polygons(grupos, limite, params.get("smooth_m", 50))
+    for gid in range(n):
 
-    # saída
-    saida = workdir / "resultado"
-    saida.mkdir(exist_ok=True)
+        pts = gdf_wgs[gdf_wgs["__gid"] == gid]
 
-    for i, pol in enumerate(grupos):
+        cell = cells[gid] if gid < len(cells) else None
 
-        pts = gdf[gdf["__gid"] == i]
+        kmz = os.path.join(kmz_dir, f"prancha_{gid+1}.kmz")
 
-        kmz = saida / f"prancha_{i+1}.kmz"
+        export_kmz(pts, cell, mun_geom, kmz)
 
-        gerar_kmz(pol, pts, kmz)
+    zip_path = os.path.join(out_dir, "resultado.zip")
 
-    zip_saida = workdir / "resultado.zip"
+    with zipfile.ZipFile(zip_path, "w") as z:
 
-    with zipfile.ZipFile(zip_saida, "w") as z:
+        z.write(excel, "pranchas.xlsx")
 
-        for f in os.listdir(saida):
+        for f in os.listdir(kmz_dir):
+            z.write(os.path.join(kmz_dir, f), f)
 
-            z.write(saida / f, f)
-
-    return zip_saida
+    return zip_path
