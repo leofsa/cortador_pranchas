@@ -19,12 +19,17 @@ def _find_first_shp(folder: Path) -> Path:
 
 
 def _validate_shapefile_set(shp_path: Path):
+
     base = shp_path.with_suffix("")
+
     needed = [".shp", ".shx", ".dbf"]
+
     missing = []
+
     for ext in needed:
         if not (base.with_suffix(ext)).exists():
             missing.append(ext)
+
     if missing:
         raise FileNotFoundError(
             f"Shapefile incompleto. Faltando: {', '.join(missing)}"
@@ -59,6 +64,7 @@ def _sort_by_spatial_morton(gdf: gpd.GeoDataFrame):
 
     g = gdf.copy()
     g["__morton"] = morton
+
     g = g.sort_values("__morton").drop(columns="__morton").reset_index(drop=True)
 
     return g
@@ -85,18 +91,35 @@ def _write_excel(points, out_xlsx):
             df["lon"] = g.geometry.x
             df["lat"] = g.geometry.y
 
-            df.to_excel(writer, sheet_name=sheet, index=False)
+            df.to_excel(writer, sheet_name=sheet[:31], index=False)
 
 
 def _kml_color(a, r, g, b):
     return f"{a:02x}{b:02x}{g:02x}{r:02x}"
 
 
-def _build_polygons_voronoi(points):
+# ------------------------------------------------------------
+# CORTE MUNICIPAL
+# ------------------------------------------------------------
+
+def _clip_points_to_municipio(points, mun_geom, mun_crs):
+
+    mun_geom_proj = gpd.GeoSeries([mun_geom], crs=mun_crs).to_crs(points.crs).iloc[0]
+
+    mask = points.geometry.within(mun_geom_proj) | points.geometry.touches(mun_geom_proj)
+
+    return points.loc[mask].copy(), mun_geom_proj
+
+
+# ------------------------------------------------------------
+# VORONOI
+# ------------------------------------------------------------
+
+def _build_polygons_voronoi(points, boundary):
 
     mp = MultiPoint(list(points.geometry))
 
-    vor = voronoi_diagram(mp)
+    vor = voronoi_diagram(mp, envelope=boundary)
 
     cells = list(vor.geoms)
 
@@ -119,22 +142,25 @@ def _smooth_polygon(poly):
         return poly
 
 
-def _write_kmz_for_group(points, polygon, out_kmz, icon_href, icon_scale, line_width):
+def _write_kmz_for_group(points, polygon, municipio, out_kmz, icon_href, icon_scale, line_width):
 
     kml = simplekml.Kml()
+
     fol = kml.newfolder(name="")
 
     icon_style = simplekml.Style()
 
     icon_style.iconstyle.icon.href = icon_href
     icon_style.iconstyle.scale = icon_scale
-    icon_style.iconstyle.color = _kml_color(255,0,0,255)
+    icon_style.iconstyle.color = _kml_color(255, 0, 0, 255)
 
     icon_style.labelstyle.scale = 0
 
     if polygon is not None:
 
         polygon = _smooth_polygon(polygon)
+
+        polygon = polygon.intersection(municipio)
 
         if polygon.geom_type == "Polygon":
 
@@ -146,7 +172,7 @@ def _write_kmz_for_group(points, polygon, out_kmz, icon_href, icon_scale, line_w
 
             pol.linestyle.width = line_width
 
-            pol.linestyle.color = _kml_color(255,255,255,0)
+            pol.linestyle.color = _kml_color(255, 255, 255, 0)
 
     for _, row in points.iterrows():
 
@@ -159,7 +185,11 @@ def _write_kmz_for_group(points, polygon, out_kmz, icon_href, icon_scale, line_w
     kml.savekmz(out_kmz)
 
 
-def processar_zip_shapefile(zip_path: Path, params: dict, workdir: Path):
+# ------------------------------------------------------------
+# PROCESSAMENTO PRINCIPAL
+# ------------------------------------------------------------
+
+def processar_zip_shapefile(zip_path: Path, params: dict, workdir: Path, mun_geom, mun_crs):
 
     extract_dir = workdir / "input"
     out_dir = workdir / "output"
@@ -176,9 +206,9 @@ def processar_zip_shapefile(zip_path: Path, params: dict, workdir: Path):
 
     _validate_shapefile_set(shp_path)
 
-    cap = int(params.get("cap",200))
-    icon_scale = float(params.get("icon_scale",0.7))
-    line_cells = float(params.get("line_cells",3.5))
+    cap = int(params.get("cap", 200))
+    icon_scale = float(params.get("icon_scale", 0.7))
+    line_cells = float(params.get("line_cells", 3.5))
 
     icon_href = params.get(
         "icon_href",
@@ -190,6 +220,17 @@ def processar_zip_shapefile(zip_path: Path, params: dict, workdir: Path):
     if gdf.crs is None:
         raise ValueError("Shapefile sem CRS")
 
+    # --------------------------------------------------------
+    # RECORTE MUNICIPAL
+    # --------------------------------------------------------
+
+    gdf, municipio_proj = _clip_points_to_municipio(gdf, mun_geom, mun_crs)
+
+    if len(gdf) == 0:
+        raise ValueError("Nenhum ponto dentro do município selecionado")
+
+    # --------------------------------------------------------
+
     pts = gdf.to_crs(4326)
 
     pts = _sort_by_spatial_morton(pts)
@@ -200,7 +241,7 @@ def processar_zip_shapefile(zip_path: Path, params: dict, workdir: Path):
 
     _write_excel(pts, excel_path)
 
-    polys = _build_polygons_voronoi(pts)
+    polys = _build_polygons_voronoi(pts, municipio_proj)
 
     n_groups = int(pts["__gid"].max()) + 1
 
@@ -215,6 +256,7 @@ def processar_zip_shapefile(zip_path: Path, params: dict, workdir: Path):
         _write_kmz_for_group(
             grp,
             poly,
+            municipio_proj,
             kmz_path,
             icon_href,
             icon_scale,
@@ -223,11 +265,11 @@ def processar_zip_shapefile(zip_path: Path, params: dict, workdir: Path):
 
     result_zip = workdir / "resultado.zip"
 
-    with zipfile.ZipFile(result_zip,"w",compression=zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(result_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
 
-        z.write(excel_path,"pranchas.xlsx")
+        z.write(excel_path, "pranchas.xlsx")
 
         for kmz in kmz_dir.glob("*.kmz"):
-            z.write(kmz,f"KMZ/{kmz.name}")
+            z.write(kmz, f"KMZ/{kmz.name}")
 
     return result_zip
