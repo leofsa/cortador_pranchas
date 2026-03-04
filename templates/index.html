@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+<title>Cortador de Pranchas</title>
+
+<style>
+
+body{
+background:#0f172a;
+font-family:Arial;
+color:white;
+display:flex;
+justify-content:center;
+align-items:center;
+height:100vh;
+}
+
+.container{
+background:#1e293b;
+padding:40px;
+border-radius:10px;
+text-align:center;
+width:400px;
+box-shadow:0 0 20px rgba(0,0,0,0.5);
+}
+
+h1{
+color:#38bdf8;
+}
+
+button{
+background:#38bdf8;
+border:none;
+padding:12px 25px;
+color:white;
+font-size:16px;
+border-radius:5px;
+cursor:pointer;
+}
+
+button:hover{
+background:#0284c7;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>🗺️ Cortador de Pranchas</h1>
+
+<p>Gerar Excel + KMZ automaticamente</p>
+
+<form action="/processar" method="post" enctype="multipart/form-data">
+
+<input type="file" name="arquivo" required>
+
+<br><br>
+
+<button type="submit">
+Gerar Pranchas
+</button>
+
+</form>
+
+</div>
+
+</body>
+</html>
