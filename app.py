@@ -22,7 +22,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Pode ser CSV ou XLSX (mesmo que o nome esteja errado)
-LOOKUP_PATH = "data/Municipios.csv"
+LOOKUP_PATH = "data/municipios.csv"
 
 
 def sanitizar_municipio(municipio: str, uf: str) -> str:
@@ -275,3 +275,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
