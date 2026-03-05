@@ -10,3 +10,4 @@ simplekml
 openpyxl
 pyogrio
 python-multipart
+jinja2
