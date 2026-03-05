@@ -65,19 +65,48 @@ def spatial_sort(gdf):
 
 
 # ---------------------------------------------------
-# carregar municípios
+# carregar municípios (AGORA GEOJSON)
 # ---------------------------------------------------
 
 def load_municipios():
 
-    shp = "data/municipios.shp"
+    path = "data/Municipios.geojson"
 
-    mun = gpd.read_file(shp)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Arquivo não encontrado: {path}")
+
+    mun = gpd.read_file(path)
 
     if mun.crs is None:
         mun = mun.set_crs(4674)
 
+    # normalizar nomes
+    mun.columns = [c.upper() for c in mun.columns]
+
     return mun
+
+
+# ---------------------------------------------------
+# descobrir colunas UF / MUNICIPIO
+# ---------------------------------------------------
+
+def detect_columns(mun):
+
+    uf_col = None
+    mun_col = None
+
+    for c in mun.columns:
+
+        if "UF" in c:
+            uf_col = c
+
+        if "MUN" in c or "NOME" in c:
+            mun_col = c
+
+    if uf_col is None or mun_col is None:
+        raise ValueError("Não foi possível detectar colunas de UF ou Município no GeoJSON")
+
+    return uf_col, mun_col
 
 
 # ---------------------------------------------------
@@ -136,7 +165,7 @@ def build_cells(points, boundary):
 
 
 # ---------------------------------------------------
-# dissolve células por grupo (igual desktop)
+# dissolve células por grupo
 # ---------------------------------------------------
 
 def dissolve_por_grupo(points, cells):
@@ -213,17 +242,14 @@ def export_kmz(points, cell, municipio, path):
     for _, r in points.iterrows():
 
         p = fol.newpoint()
-
         p.coords = [(r.geometry.x, r.geometry.y)]
 
     if cell and _is_geom(cell):
 
         pol = fol.newpolygon()
-
         pol.outerboundaryis = list(cell.exterior.coords)
 
     pol = fol.newpolygon()
-
     pol.outerboundaryis = list(municipio.exterior.coords)
 
     kml.savekmz(path)
@@ -237,19 +263,24 @@ def processar(shp_path, uf, municipio, cap, out_dir):
 
     mun = load_municipios()
 
+    uf_col, mun_col = detect_columns(mun)
+
     gdf = gpd.read_file(shp_path)
 
     gdf = gdf[gdf.geometry.notnull()].copy()
 
     mun_geom = mun[
-        (mun["SIGLA_UF"] == uf) &
-        (mun["NM_MUN"] == municipio)
+        (mun[uf_col] == uf) &
+        (mun[mun_col].str.upper() == municipio.upper())
     ].geometry.iloc[0]
 
     gdf = gdf[
         gdf.geometry.within(mun_geom) |
         gdf.geometry.touches(mun_geom)
     ]
+
+    if len(gdf) == 0:
+        raise ValueError("Nenhum ponto dentro do município")
 
     utm = guess_utm(gdf)
 
@@ -296,7 +327,6 @@ def processar(shp_path, uf, municipio, cap, out_dir):
         z.write(excel, "pranchas.xlsx")
 
         for f in os.listdir(kmz_dir):
-
             z.write(os.path.join(kmz_dir, f), f)
 
     return zip_path
