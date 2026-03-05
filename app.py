@@ -4,6 +4,8 @@ import uuid
 import shutil
 import zipfile
 import pandas as pd
+import csv
+from io import StringIO
 
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
@@ -19,7 +21,6 @@ OUTPUT_DIR = "outputs"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# CSV leve (só para lista UF/Municípios) — evita OOM no Render
 LOOKUP_PATH = "data/Municipios.csv"
 
 
@@ -36,61 +37,115 @@ def sanitizar_municipio(municipio: str, uf: str) -> str:
         s = re.sub(rf"\(\s*{re.escape(uf2)}\s*\)\s*$", "", s, flags=re.IGNORECASE).strip()
         if s.upper().endswith(" " + uf2):
             s = s[: -(len(uf2) + 1)].strip()
-
     return s
+
+
+def _ler_texto_com_fallback(path: str) -> str:
+    # tenta utf-8, se falhar latin-1 (excel/ansi)
+    with open(path, "rb") as f:
+        data = f.read()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
+def _detectar_delimitador(sample: str) -> str:
+    # tenta sniffer, se falhar usa heurística
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t"])
+        return dialect.delimiter
+    except Exception:
+        # heurística: escolhe o que mais aparece no cabeçalho
+        header = sample.splitlines()[0] if sample.splitlines() else ""
+        if header.count(";") >= header.count(","):
+            return ";"
+        return ","
 
 
 def get_lookup() -> pd.DataFrame:
     """
-    Leitura robusta do CSV:
-    - tenta utf-8 e depois latin-1 (Excel/Windows-1252)
-    - tenta separador ',' e depois ';'
-    - usa engine='python' e on_bad_lines='skip' para pular linhas quebradas
+    Leitura EXTREMAMENTE robusta do Municipios.csv:
+    - aceita encoding utf-8 ou latin-1
+    - aceita separador ',' ou ';' (auto)
+    - corrige linhas com colunas extras:
+        assume que a UF é o ÚLTIMO campo da linha
+        e o nome do município é todo o resto juntado
     """
     if not os.path.exists(LOOKUP_PATH):
         raise RuntimeError(f"Arquivo não encontrado: {LOOKUP_PATH}")
 
-    encodings = ["utf-8", "latin-1"]
-    seps = [",", ";"]
+    text = _ler_texto_com_fallback(LOOKUP_PATH)
+    sio = StringIO(text)
 
-    last_err = None
-    df = None
+    # amostra para detectar delimitador
+    sample = "\n".join(text.splitlines()[:20])
+    delim = _detectar_delimitador(sample)
 
-    for enc in encodings:
-        for sep in seps:
-            try:
-                df = pd.read_csv(
-                    LOOKUP_PATH,
-                    dtype=str,
-                    encoding=enc,
-                    sep=sep,
-                    engine="python",
-                    on_bad_lines="skip",
-                )
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-        if df is not None:
-            break
+    reader = csv.reader(sio, delimiter=delim)
 
-    if df is None:
-        raise RuntimeError(f"Falha ao ler CSV: {last_err}")
+    try:
+        header = next(reader)
+    except StopIteration:
+        raise RuntimeError("CSV vazio.")
 
-    # garante colunas esperadas (aceita variações de maiúsculas/minúsculas)
-    cols = {c.strip().upper(): c for c in df.columns}
-    if "SIGLA_UF" not in cols or "NM_MUN" not in cols:
-        raise RuntimeError(
-            f"CSV precisa ter colunas NM_MUN e SIGLA_UF. Colunas encontradas: {list(df.columns)}"
-        )
+    header_norm = [h.strip().upper() for h in header]
 
-    # padroniza nomes
-    df = df.rename(columns={cols["SIGLA_UF"]: "SIGLA_UF", cols["NM_MUN"]: "NM_MUN"})
+    # achar índices das colunas esperadas
+    def _idx(nome: str):
+        try:
+            return header_norm.index(nome)
+        except ValueError:
+            return None
 
+    idx_mun = _idx("NM_MUN")
+    idx_uf = _idx("SIGLA_UF")
+
+    if idx_mun is None or idx_uf is None:
+        raise RuntimeError(f"CSV precisa ter colunas NM_MUN e SIGLA_UF. Cabeçalho: {header}")
+
+    rows = []
+    for row in reader:
+        if not row:
+            continue
+
+        # normaliza: remove espaços
+        row = [c.strip() for c in row]
+
+        # Se a linha vier com menos colunas, ignora
+        if len(row) < 2:
+            continue
+
+        # Caso normal: pega pelos índices
+        # Porém: se a linha veio com colunas extras (len(row) > len(header)),
+        # o parser já dividiu mais do que devia. A forma mais segura:
+        # - considerar UF como o último campo
+        # - considerar município como a junção do resto (pra não perder nada)
+        if len(row) != len(header):
+            uf = row[-1]
+            mun = " ".join([c for c in row[:-1] if c]).strip()
+        else:
+            mun = row[idx_mun] if idx_mun < len(row) else ""
+            uf = row[idx_uf] if idx_uf < len(row) else ""
+
+        if not mun or not uf:
+            continue
+
+        uf = str(uf).strip().upper()
+        mun = str(mun).strip()
+
+        # valida UF (2 letras)
+        if len(uf) != 2:
+            continue
+
+        rows.append((uf, mun))
+
+    if not rows:
+        raise RuntimeError("Não consegui extrair nenhuma linha válida do CSV (UF/Município).")
+
+    df = pd.DataFrame(rows, columns=["SIGLA_UF", "NM_MUN"])
     df["SIGLA_UF"] = df["SIGLA_UF"].astype(str).str.strip().str.upper()
     df["NM_MUN"] = df["NM_MUN"].astype(str).str.strip()
-
-    # remove vazios + dupes
     df = df[(df["SIGLA_UF"] != "") & (df["NM_MUN"] != "")]
     df = df.drop_duplicates(subset=["SIGLA_UF", "NM_MUN"])
     return df
@@ -106,7 +161,6 @@ async def head_root():
     return PlainTextResponse("", status_code=200)
 
 
-# evita erro quando a pessoa abre /processar no navegador (GET)
 @app.get("/processar", include_in_schema=False)
 async def processar_get():
     return RedirectResponse(url="/", status_code=302)
@@ -161,15 +215,12 @@ async def cortar(
         if cap <= 0:
             raise ValueError("Postes por prancha (cap) deve ser > 0.")
 
-        # salva ZIP
         with open(temp_zip, "wb") as f:
             shutil.copyfileobj(arquivo.file, f)
 
-        # extrai
         with zipfile.ZipFile(temp_zip, "r") as zip_ref:
             zip_ref.extractall(extract_dir)
 
-        # acha .shp
         for root, _, files in os.walk(extract_dir):
             for file in files:
                 if file.lower().endswith(".shp"):
@@ -181,7 +232,6 @@ async def cortar(
         if not shp_path:
             raise ValueError("Arquivo .shp não encontrado dentro do ZIP enviado.")
 
-        # processa (polígono continua vindo do Municipios.geojson no cortarpontos.py)
         resultado_zip = processar(shp_path, uf_norm, municipio_norm, cap, out_dir)
 
         safe_name = re.sub(r"[^A-Za-z0-9_\-]+", "_", municipio_norm).strip("_") or "resultado"
@@ -196,7 +246,6 @@ async def cortar(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
     finally:
-        # limpeza
         try:
             if os.path.exists(temp_zip):
                 os.remove(temp_zip)
@@ -212,6 +261,5 @@ async def cortar(
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
