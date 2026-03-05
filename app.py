@@ -4,7 +4,8 @@ import shutil
 import uuid
 import os
 
-from cortador import processar
+# IMPORTA DO SEU SCRIPT REAL
+from cortarpontos import processar
 
 app = FastAPI()
 
@@ -25,15 +26,28 @@ async def cortar(
 
     uid = str(uuid.uuid4())
 
-    shp_path = os.path.join(UPLOAD, uid + ".shp")
+    # salvar upload
+    shp_path = os.path.join(UPLOAD, f"{uid}.shp")
 
-    with open(shp_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    with open(shp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
+    # pasta de saída
     out_dir = os.path.join(OUTPUT, uid)
+    os.makedirs(out_dir, exist_ok=True)
 
-    os.makedirs(out_dir)
+    # chama seu algoritmo
+    zip_path = processar(
+        shp_path,
+        uf,
+        municipio,
+        cap,
+        out_dir
+    )
 
-    zip_path = processar(shp_path, uf, municipio, cap, out_dir)
-
-    return FileResponse(zip_path, filename="resultado.zip")
+    # retorna download
+    return FileResponse(
+        zip_path,
+        filename="resultado.zip",
+        media_type="application/zip"
+    )
