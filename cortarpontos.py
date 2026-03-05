@@ -1,5 +1,4 @@
 import os
-import math
 import zipfile
 import geopandas as gpd
 import pandas as pd
@@ -27,7 +26,7 @@ def _safe_unary_union(geoms):
 
 
 # ---------------------------------------------------
-# Morton spatial sort (igual desktop)
+# Morton spatial sort
 # ---------------------------------------------------
 
 def _part1by1(n):
@@ -115,17 +114,12 @@ def assign_groups(gdf, cap):
 
 
 # ---------------------------------------------------
-# criar partições
+# construir células Voronoi
 # ---------------------------------------------------
 
 def build_cells(points, boundary):
 
-    geoms = [g for g in points.geometry if _is_geom(g)]
-
-    if len(geoms) < 2:
-        raise ValueError("Poucos pontos para gerar Voronoi")
-
-    mp = MultiPoint(geoms)
+    mp = MultiPoint(list(points.geometry))
 
     vd = voronoi_diagram(mp, envelope=boundary)
 
@@ -139,6 +133,49 @@ def build_cells(points, boundary):
             cells.append(c)
 
     return cells
+
+
+# ---------------------------------------------------
+# dissolve células por grupo (igual desktop)
+# ---------------------------------------------------
+
+def dissolve_por_grupo(points, cells):
+
+    cells_gdf = gpd.GeoDataFrame(
+        {"cell_id": range(len(cells))},
+        geometry=cells,
+        crs=points.crs
+    )
+
+    join = gpd.sjoin(
+        points[["__gid", "geometry"]],
+        cells_gdf,
+        how="left",
+        predicate="within"
+    )
+
+    grupos = {}
+
+    for _, r in join.iterrows():
+
+        gid = int(r["__gid"])
+        cid = int(r["cell_id"])
+
+        geom = cells_gdf.loc[cid, "geometry"]
+
+        grupos.setdefault(gid, []).append(geom)
+
+    n = points["__gid"].max() + 1
+
+    dissolvidos = []
+
+    for gid in range(n):
+
+        uu = _safe_unary_union(grupos.get(gid, []))
+
+        dissolvidos.append(uu)
+
+    return dissolvidos
 
 
 # ---------------------------------------------------
@@ -175,9 +212,6 @@ def export_kmz(points, cell, municipio, path):
 
     for _, r in points.iterrows():
 
-        if not _is_geom(r.geometry):
-            continue
-
         p = fol.newpoint()
 
         p.coords = [(r.geometry.x, r.geometry.y)]
@@ -188,11 +222,9 @@ def export_kmz(points, cell, municipio, path):
 
         pol.outerboundaryis = list(cell.exterior.coords)
 
-    if _is_geom(municipio):
+    pol = fol.newpolygon()
 
-        pol = fol.newpolygon()
-
-        pol.outerboundaryis = list(municipio.exterior.coords)
+    pol.outerboundaryis = list(municipio.exterior.coords)
 
     kml.savekmz(path)
 
@@ -207,9 +239,6 @@ def processar(shp_path, uf, municipio, cap, out_dir):
 
     gdf = gpd.read_file(shp_path)
 
-    if len(gdf) == 0:
-        raise ValueError("Shapefile vazio")
-
     gdf = gdf[gdf.geometry.notnull()].copy()
 
     mun_geom = mun[
@@ -217,32 +246,24 @@ def processar(shp_path, uf, municipio, cap, out_dir):
         (mun["NM_MUN"] == municipio)
     ].geometry.iloc[0]
 
-    # recorte mais seguro
     gdf = gdf[
         gdf.geometry.within(mun_geom) |
         gdf.geometry.touches(mun_geom)
     ]
 
-    if len(gdf) == 0:
-        raise ValueError("Nenhum ponto dentro do município")
-
     utm = guess_utm(gdf)
 
     gdf = gdf.to_crs(utm)
 
-    mun_geom = gpd.GeoSeries(
-        [mun_geom],
-        crs=mun.crs
-    ).to_crs(utm).iloc[0].buffer(0)
+    mun_geom = gpd.GeoSeries([mun_geom], crs=mun.crs).to_crs(utm).iloc[0]
 
-    # ordenar espacialmente
     gdf = spatial_sort(gdf)
 
-    # criar grupos
     gdf = assign_groups(gdf, cap)
 
-    # gerar voronoi
     cells = build_cells(gdf, mun_geom)
+
+    grupos = dissolve_por_grupo(gdf, cells)
 
     gdf_wgs = gdf.to_crs(4326)
 
@@ -262,7 +283,7 @@ def processar(shp_path, uf, municipio, cap, out_dir):
 
         pts = gdf_wgs[gdf_wgs["__gid"] == gid]
 
-        cell = cells[gid] if gid < len(cells) else None
+        cell = grupos[gid]
 
         kmz = os.path.join(kmz_dir, f"prancha_{gid+1}.kmz")
 
@@ -275,6 +296,7 @@ def processar(shp_path, uf, municipio, cap, out_dir):
         z.write(excel, "pranchas.xlsx")
 
         for f in os.listdir(kmz_dir):
+
             z.write(os.path.join(kmz_dir, f), f)
 
     return zip_path
