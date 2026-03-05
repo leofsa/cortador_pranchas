@@ -30,61 +30,33 @@ backdrop-filter:blur(8px);
 }
 
 .title{
-display:flex;
-align-items:center;
-gap:12px;
-margin:0 0 6px 0;
 font-size:34px;
 color:#38bdf8;
 font-weight:800;
-}
-
-.subtitle{
-margin:0 0 18px 0;
-opacity:0.9;
-font-size:14px;
-line-height:1.4;
+margin-bottom:10px;
 }
 
 .grid{
 display:grid;
 grid-template-columns:1fr 1fr;
 gap:14px;
-margin-top:14px;
 }
 
 label{
-display:block;
 font-size:13px;
-margin-bottom:6px;
 }
 
 input,select{
 width:100%;
-box-sizing:border-box;
 padding:12px;
 border-radius:10px;
 border:1px solid rgba(255,255,255,0.14);
 background:rgba(0,0,0,0.25);
 color:#fff;
-outline:none;
 }
 
 .full{
 grid-column:1/-1;
-}
-
-.small{
-font-size:12px;
-opacity:0.75;
-}
-
-.note{
-margin-top:10px;
-font-size:13px;
-background:rgba(255,255,255,0.06);
-border-radius:12px;
-padding:12px;
 }
 
 .btn{
@@ -103,7 +75,6 @@ cursor:pointer;
 .loading{
 display:none;
 margin-top:10px;
-font-size:13px;
 }
 
 </style>
@@ -115,89 +86,34 @@ font-size:13px;
 
 <h1 class="title">🗺️ Cortador de Pranchas</h1>
 
-<p class="subtitle">
-Envie <b>ZIP com shapefile</b> e selecione o município para gerar pranchas automaticamente.
-</p>
-
 <form id="form" action="/processar" method="post" enctype="multipart/form-data">
 
 <div class="grid">
 
 <div class="full">
-<label>Shapefile (ZIP)</label>
-<input type="file" name="arquivo" accept=".zip" required>
-<div class="small">⚠️ O ZIP precisa conter .shp .shx .dbf .prj</div>
+<label>Shapefile ZIP</label>
+<input type="file" name="file" accept=".zip" required>
 </div>
-
 
 <div>
 <label>UF</label>
 <select name="uf" id="uf" required>
-
-<option value="">Selecione</option>
-
-{% for uf in ufs %}
-<option value="{{uf}}">{{uf}}</option>
-{% endfor %}
-
+<option value="">Carregando...</option>
 </select>
 </div>
-
 
 <div>
 <label>Município</label>
 <select name="municipio" id="municipio" required>
-<option value="">Selecione a UF primeiro</option>
+<option value="">Selecione a UF</option>
 </select>
 </div>
 
-
 <div>
 <label>Postes por prancha</label>
-<input name="cap" type="number" value="200" min="1">
+<input name="cap" type="number" value="200">
 </div>
 
-<div>
-<label>Ícone escala</label>
-<input name="icon_scale" type="number" step="0.1" value="0.7">
-</div>
-
-
-<div>
-<label>Linha pranchas</label>
-<input name="line_cells" type="number" step="0.1" value="3.5">
-</div>
-
-
-<div>
-<label>Linha município</label>
-<input name="line_mun" type="number" step="0.1" value="5.0">
-</div>
-
-
-<div class="full">
-<label>Ícone URL</label>
-<input name="icon_href" type="text"
-value="http://maps.google.com/mapfiles/kml/paddle/wht-blank.png">
-</div>
-
-
-<div>
-<label>Curvas (m)</label>
-<input name="smooth_m" type="number" value="50">
-</div>
-
-
-<div>
-<label>Fix pontos (m)</label>
-<input name="fix_buf" type="number" step="0.5" value="2">
-</div>
-
-</div>
-
-
-<div class="note">
-✅ Saída: Excel + KMZ dentro de resultado.zip
 </div>
 
 <button class="btn" id="btn" type="submit">
@@ -205,30 +121,48 @@ Gerar Excel + KMZ
 </button>
 
 <div class="loading" id="loading">
-⏳ Processando… aguarde.
+⏳ Processando...
 </div>
 
 </form>
 
 </div>
 
-
 <script>
 
 const uf = document.getElementById("uf")
 const municipio = document.getElementById("municipio")
+
+async function carregarUFs(){
+
+const res = await fetch("/ufs")
+const data = await res.json()
+
+uf.innerHTML = "<option value=''>Selecione</option>"
+
+data.ufs.forEach(u => {
+
+const opt = document.createElement("option")
+
+opt.value = u
+opt.text = u
+
+uf.appendChild(opt)
+
+})
+
+}
 
 uf.addEventListener("change", async () => {
 
 municipio.innerHTML = "<option>Carregando...</option>"
 
 const res = await fetch("/municipios/" + uf.value)
-
 const data = await res.json()
 
 municipio.innerHTML = ""
 
-data.forEach(m => {
+data.municipios.forEach(m => {
 
 const opt = document.createElement("option")
 
@@ -240,6 +174,8 @@ municipio.appendChild(opt)
 })
 
 })
+
+window.onload = carregarUFs
 
 const form = document.getElementById("form")
 const btn = document.getElementById("btn")
