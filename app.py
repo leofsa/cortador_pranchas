@@ -1,11 +1,12 @@
-from fastapi import FastAPI, UploadFile, File, Form
+import os
+import uuid
+import shutil
+import zipfile
+import geopandas as gpd
+
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.requests import Request
-import shutil
-import uuid
-import os
-import geopandas as gpd
 
 from cortarpontos import processar
 
@@ -20,28 +21,21 @@ os.makedirs(UPLOAD, exist_ok=True)
 os.makedirs(OUTPUT, exist_ok=True)
 
 
-# ------------------------------
-# carregar municipios
-# ------------------------------
+# ---------------------------
+# carregar municípios
+# ---------------------------
 
-def carregar_base():
+BASE = gpd.read_file("data/Municipios.geojson")
 
-    gdf = gpd.read_file("data/Municipios.geojson")
+BASE.columns = [c.upper() for c in BASE.columns]
 
-    if gdf.crs is None:
-        gdf = gdf.set_crs(4674)
-
-    gdf.columns = [c.upper() for c in gdf.columns]
-
-    return gdf
+if BASE.crs is None:
+    BASE = BASE.set_crs(4674)
 
 
-BASE = carregar_base()
-
-
-# ------------------------------
+# ---------------------------
 # HOME
-# ------------------------------
+# ---------------------------
 
 @app.get("/")
 def home(request: Request):
@@ -57,9 +51,9 @@ def home(request: Request):
     )
 
 
-# ------------------------------
+# ---------------------------
 # MUNICIPIOS
-# ------------------------------
+# ---------------------------
 
 @app.get("/municipios/{uf}")
 def listar_municipios(uf: str):
@@ -71,9 +65,9 @@ def listar_municipios(uf: str):
     return municipios
 
 
-# ------------------------------
+# ---------------------------
 # PROCESSAR
-# ------------------------------
+# ---------------------------
 
 @app.post("/processar")
 async def cortar(
@@ -90,10 +84,27 @@ async def cortar(
     with open(zip_path, "wb") as f:
         shutil.copyfileobj(arquivo.file, f)
 
+    extract_dir = os.path.join(UPLOAD, uid)
+
+    os.makedirs(extract_dir)
+
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_dir)
+
+    shp_path = None
+
+    for file in os.listdir(extract_dir):
+        if file.endswith(".shp"):
+            shp_path = os.path.join(extract_dir, file)
+            break
+
+    if shp_path is None:
+        raise Exception("Shapefile .shp não encontrado dentro do ZIP")
+
     out_dir = os.path.join(OUTPUT, uid)
 
     os.makedirs(out_dir)
 
-    resultado = processar(zip_path, uf, municipio, cap, out_dir)
+    resultado = processar(shp_path, uf, municipio, cap, out_dir)
 
     return FileResponse(resultado, filename="resultado.zip")
