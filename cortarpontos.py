@@ -16,7 +16,7 @@ from pyproj import CRS
 # Helpers de Normalização e Geometria
 # ===================================================
 
-def _is_geom(g):
+def _is_geom(g) -> bool:
     return g is not None and (not getattr(g, "is_empty", True))
 
 def _limpar_geometria(g):
@@ -24,7 +24,7 @@ def _limpar_geometria(g):
     if not _is_geom(g):
         return None
     try:
-        if not g.is_valid:
+        if hasattr(g, "is_valid") and (not g.is_valid):
             g = make_valid(g)
         # buffer(0) resolve muitos self-intersections
         g = g.buffer(0)
@@ -37,10 +37,13 @@ def _safe_unary_union(geoms):
     geoms = [_limpar_geometria(g) for g in geoms if _is_geom(g)]
     if not geoms:
         return None
-    u = unary_union(geoms)
-    return _limpar_geometria(u)
+    try:
+        u = unary_union(geoms)
+        return _limpar_geometria(u)
+    except Exception:
+        return None
 
-def remover_acentos(txt):
+def remover_acentos(txt) -> str:
     """Remove acentos + normaliza para comparação."""
     if txt is None:
         return ""
@@ -70,7 +73,7 @@ def sanitizar_municipio(municipio: str, uf: str) -> str:
     s = re.sub(rf"(\s*[-/]\s*{re.escape(uf2)})\s*$", "", s, flags=re.IGNORECASE).strip()
     s = re.sub(rf"\(\s*{re.escape(uf2)}\s*\)\s*$", "", s, flags=re.IGNORECASE).strip()
 
-    # remove UF solta no final
+    # remove UF solta no final (ex: "MAURILANDIA GO")
     if s.upper().endswith(" " + uf2):
         s = s[: -(len(uf2) + 1)].strip()
 
@@ -81,7 +84,7 @@ def sanitizar_municipio(municipio: str, uf: str) -> str:
 # Morton Spatial Sort (Z-Order Curve)
 # ===================================================
 
-def _part1by1(n):
+def _part1by1(n: int) -> int:
     n = int(n) & 0xFFFFFFFF
     n = (n | (n << 8)) & 0x00FF00FF
     n = (n | (n << 4)) & 0x0F0F0F0F
@@ -89,10 +92,10 @@ def _part1by1(n):
     n = (n | (n << 1)) & 0x55555555
     return n
 
-def morton_code(x, y):
+def morton_code(x: int, y: int) -> int:
     return _part1by1(x) | (_part1by1(y) << 1)
 
-def spatial_sort(gdf):
+def spatial_sort(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     if len(gdf) == 0:
         return gdf
     g = gdf.copy()
@@ -118,10 +121,11 @@ def spatial_sort(gdf):
 # Dados de Municípios e UTM
 # ===================================================
 
-def load_municipios():
+def load_municipios() -> gpd.GeoDataFrame:
     path = "data/Municipios.geojson"
     if not os.path.exists(path):
         raise FileNotFoundError(f"Arquivo não encontrado: {path}")
+
     mun = gpd.read_file(path)
     mun.columns = [c.upper() for c in mun.columns]
 
@@ -133,7 +137,7 @@ def load_municipios():
 
     return mun
 
-def detect_columns(mun):
+def detect_columns(mun: gpd.GeoDataFrame):
     cols = list(mun.columns)
     uf_col = "SIGLA_UF" if "SIGLA_UF" in cols else next((c for c in cols if "UF" in c), None)
     mun_col = "NM_MUN" if "NM_MUN" in cols else next((c for c in cols if "MUN" in c or "NOME" in c), None)
@@ -142,7 +146,7 @@ def detect_columns(mun):
         raise ValueError(f"Não foi possível detectar colunas UF/Município. Colunas: {cols}")
     return uf_col, mun_col
 
-def guess_utm(gdf):
+def guess_utm(gdf: gpd.GeoDataFrame) -> CRS:
     g = gdf.to_crs(4326)
     centroid = g.geometry.unary_union.centroid
     lon, lat = centroid.x, centroid.y
@@ -155,7 +159,7 @@ def guess_utm(gdf):
 # Voronoi / Dissolve por grupo
 # ===================================================
 
-def build_cells(points, boundary):
+def build_cells(points: gpd.GeoDataFrame, boundary):
     boundary = _limpar_geometria(boundary)
     if boundary is None:
         return []
@@ -170,15 +174,17 @@ def build_cells(points, boundary):
             cells.append(_limpar_geometria(inter))
     return [c for c in cells if _is_geom(c)]
 
-def dissolve_por_grupo(points, cells):
+def dissolve_por_grupo(points: gpd.GeoDataFrame, cells):
     if not cells:
-        # fallback: sem células, retorna lista de None no tamanho dos grupos
         max_gid = int(points["__gid"].max()) if len(points) else -1
         return [None] * (max_gid + 1)
 
     cells_gdf = gpd.GeoDataFrame({"cell_id": range(len(cells))}, geometry=cells, crs=points.crs)
 
     points = points[points.geometry.notnull()].copy()
+
+    # sjoin requer rtree/pygeos dependendo do ambiente; mas no seu requirements tem pyogrio,
+    # então geralmente OK. Se falhar, o erro vai ser claro.
     join = gpd.sjoin(points[["__gid", "geometry"]], cells_gdf, how="inner", predicate="within")
 
     geom_map = cells_gdf["geometry"].to_dict()
@@ -199,7 +205,7 @@ def dissolve_por_grupo(points, cells):
 # Exportação
 # ===================================================
 
-def export_excel(points_wgs, out_path):
+def export_excel(points_wgs: gpd.GeoDataFrame, out_path: str):
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         for gid in sorted(points_wgs["__gid"].unique()):
             g = points_wgs[points_wgs["__gid"] == gid].copy()
@@ -208,7 +214,7 @@ def export_excel(points_wgs, out_path):
             df["LAT"] = g.geometry.y
             df.to_excel(writer, sheet_name=f"Prancha {int(gid) + 1}", index=False)
 
-def export_kmz(points_wgs, cell_wgs, path):
+def export_kmz(points_wgs: gpd.GeoDataFrame, cell_wgs, path: str):
     kml = simplekml.Kml()
     fol = kml.newfolder(name="Dados")
 
@@ -232,27 +238,29 @@ def export_kmz(points_wgs, cell_wgs, path):
 # Pipeline Principal
 # ===================================================
 
-def processar(shp_path, uf, municipio, cap, out_dir):
-    # --- Normaliza entrada (corrige "Maurilândia-GO") ---
+def processar(shp_path: str, uf: str, municipio: str, cap: int, out_dir: str) -> str:
+    # --- Normaliza entrada ---
     uf_alvo = (uf or "").strip().upper()
     municipio_limpo = sanitizar_municipio(municipio, uf_alvo)
 
     mun = load_municipios()
     uf_col, mun_col = detect_columns(mun)
 
-    # --- Normaliza base ---
+    # --- Normaliza base (AQUI está o ajuste do erro do .upper em Series) ---
     mun[uf_col] = mun[uf_col].astype(str).str.strip().str.upper()
-    mun["__NORM"] = mun[mun_col].apply(remover_acentos)
+    mun["__NORM"] = mun[mun_col].astype(str).apply(remover_acentos)
 
     mun_alvo = remover_acentos(municipio_limpo)
 
     selecao = mun[(mun[uf_col] == uf_alvo) & (mun["__NORM"] == mun_alvo)]
 
     if selecao.empty:
-        # sugestões mais úteis (já normalizadas)
         sub = mun[mun[uf_col] == uf_alvo].copy()
         opcoes = list(sub[mun_col].dropna().unique()[:10])
-        raise ValueError(f"Município '{municipio}' (normalizado para '{municipio_limpo}') não encontrado em {uf_alvo}. Sugestões: {opcoes}")
+        raise ValueError(
+            f"Município '{municipio}' (normalizado para '{municipio_limpo}') "
+            f"não encontrado em {uf_alvo}. Sugestões: {opcoes}"
+        )
 
     mun_geom_orig = _limpar_geometria(selecao.geometry.iloc[0])
     if mun_geom_orig is None:
@@ -264,7 +272,6 @@ def processar(shp_path, uf, municipio, cap, out_dir):
 
     # CRS: tenta harmonizar
     if gdf.crs is None:
-        # se o shapefile vier sem CRS, assume o mesmo da base (melhor do que quebrar)
         gdf = gdf.set_crs(mun.crs)
     elif gdf.crs != mun.crs:
         gdf = gdf.to_crs(mun.crs)
@@ -280,6 +287,7 @@ def processar(shp_path, uf, municipio, cap, out_dir):
     mun_geom_utm = gpd.GeoSeries([mun_geom_orig], crs=mun.crs).to_crs(utm_crs).iloc[0]
 
     gdf_utm = spatial_sort(gdf_utm)
+
     cap = int(cap) if int(cap) > 0 else 200
     gdf_utm["__gid"] = np.arange(len(gdf_utm)) // cap
 
