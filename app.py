@@ -1,3 +1,6 @@
+@app.get("/")
+def home():
+return {"status": "API Cortador de Pranchas funcionando"}
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse
 import shutil
@@ -51,3 +54,4 @@ async def cortar(
         filename="resultado.zip",
         media_type="application/zip"
     )
+
