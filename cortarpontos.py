@@ -277,7 +277,7 @@ def processar(shp_path, uf, municipio, cap, out_dir):
     mun_geom = mun[
         (mun[uf_col] == uf) &
         (mun[mun_col].str.upper() == municipio.upper())
-   ]["GEOMETRY"].iloc[0]
+   ].geometry.iloc[0]
 
     gdf = gdf[
         gdf.geometry.within(mun_geom) |
