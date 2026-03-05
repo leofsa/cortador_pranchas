@@ -27,6 +27,45 @@ def _safe_unary_union(geoms):
 
 
 # ---------------------------------------------------
+# Morton spatial sort (igual desktop)
+# ---------------------------------------------------
+
+def _part1by1(n):
+    n = (n | (n << 8)) & 0x00FF00FF
+    n = (n | (n << 4)) & 0x0F0F0F0F
+    n = (n | (n << 2)) & 0x33333333
+    n = (n | (n << 1)) & 0x55555555
+    return n
+
+
+def morton_code(x, y):
+    return _part1by1(x) | (_part1by1(y) << 1)
+
+
+def spatial_sort(gdf):
+
+    g = gdf.copy()
+
+    xs = g.geometry.x
+    ys = g.geometry.y
+
+    xmin, xmax = xs.min(), xs.max()
+    ymin, ymax = ys.min(), ys.max()
+
+    dx = xmax - xmin if xmax != xmin else 1
+    dy = ymax - ymin if ymax != ymin else 1
+
+    x_norm = ((xs - xmin) / dx * 65535).astype(int)
+    y_norm = ((ys - ymin) / dy * 65535).astype(int)
+
+    g["__morton"] = morton_code(x_norm, y_norm)
+
+    g = g.sort_values("__morton").drop(columns="__morton")
+
+    return g.reset_index(drop=True)
+
+
+# ---------------------------------------------------
 # carregar municípios
 # ---------------------------------------------------
 
@@ -63,24 +102,6 @@ def guess_utm(gdf):
 
 
 # ---------------------------------------------------
-# ordenar spatial
-# ---------------------------------------------------
-
-def spatial_sort(gdf):
-
-    g = gdf.copy()
-
-    g["x"] = g.geometry.x
-    g["y"] = g.geometry.y
-
-    g = g.sort_values(["x", "y"])
-
-    g = g.reset_index(drop=True)
-
-    return g.drop(columns=["x", "y"])
-
-
-# ---------------------------------------------------
 # grupos fixos
 # ---------------------------------------------------
 
@@ -99,7 +120,12 @@ def assign_groups(gdf, cap):
 
 def build_cells(points, boundary):
 
-    mp = MultiPoint(list(points.geometry))
+    geoms = [g for g in points.geometry if _is_geom(g)]
+
+    if len(geoms) < 2:
+        raise ValueError("Poucos pontos para gerar Voronoi")
+
+    mp = MultiPoint(geoms)
 
     vd = voronoi_diagram(mp, envelope=boundary)
 
@@ -107,7 +133,7 @@ def build_cells(points, boundary):
 
     for c in vd.geoms:
 
-        c = c.intersection(boundary)
+        c = c.intersection(boundary).buffer(0)
 
         if _is_geom(c):
             cells.append(c)
@@ -134,7 +160,7 @@ def export_excel(points, out):
             df["lon"] = g.geometry.x
             df["lat"] = g.geometry.y
 
-            df.to_excel(writer, sheet_name=f"Prancha {gid+1}")
+            df.to_excel(writer, sheet_name=f"Prancha {gid+1}", index=False)
 
 
 # ---------------------------------------------------
@@ -149,19 +175,24 @@ def export_kmz(points, cell, municipio, path):
 
     for _, r in points.iterrows():
 
+        if not _is_geom(r.geometry):
+            continue
+
         p = fol.newpoint()
 
         p.coords = [(r.geometry.x, r.geometry.y)]
 
-    if cell:
+    if cell and _is_geom(cell):
 
         pol = fol.newpolygon()
 
         pol.outerboundaryis = list(cell.exterior.coords)
 
-    pol = fol.newpolygon()
+    if _is_geom(municipio):
 
-    pol.outerboundaryis = list(municipio.exterior.coords)
+        pol = fol.newpolygon()
+
+        pol.outerboundaryis = list(municipio.exterior.coords)
 
     kml.savekmz(path)
 
@@ -176,23 +207,46 @@ def processar(shp_path, uf, municipio, cap, out_dir):
 
     gdf = gpd.read_file(shp_path)
 
-    mun_geom = mun[(mun["SIGLA_UF"] == uf) & (mun["NM_MUN"] == municipio)].geometry.iloc[0]
+    if len(gdf) == 0:
+        raise ValueError("Shapefile vazio")
 
-    gdf = gdf[gdf.geometry.within(mun_geom)]
+    gdf = gdf[gdf.geometry.notnull()].copy()
+
+    mun_geom = mun[
+        (mun["SIGLA_UF"] == uf) &
+        (mun["NM_MUN"] == municipio)
+    ].geometry.iloc[0]
+
+    # recorte mais seguro
+    gdf = gdf[
+        gdf.geometry.within(mun_geom) |
+        gdf.geometry.touches(mun_geom)
+    ]
+
+    if len(gdf) == 0:
+        raise ValueError("Nenhum ponto dentro do município")
 
     utm = guess_utm(gdf)
 
     gdf = gdf.to_crs(utm)
 
-    mun_geom = gpd.GeoSeries([mun_geom], crs=mun.crs).to_crs(utm).iloc[0]
+    mun_geom = gpd.GeoSeries(
+        [mun_geom],
+        crs=mun.crs
+    ).to_crs(utm).iloc[0].buffer(0)
 
+    # ordenar espacialmente
     gdf = spatial_sort(gdf)
 
+    # criar grupos
     gdf = assign_groups(gdf, cap)
 
+    # gerar voronoi
     cells = build_cells(gdf, mun_geom)
 
     gdf_wgs = gdf.to_crs(4326)
+
+    os.makedirs(out_dir, exist_ok=True)
 
     excel = os.path.join(out_dir, "pranchas.xlsx")
 
