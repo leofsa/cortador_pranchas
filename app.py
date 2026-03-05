@@ -5,7 +5,6 @@ import shutil
 import zipfile
 import pandas as pd
 import csv
-from io import StringIO
 
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
@@ -16,13 +15,47 @@ from cortarpontos import processar
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
-UPLOAD_DIR = "uploads"
-OUTPUT_DIR = "outputs"
+# =========================================
+# Pastas
+# =========================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Pode ser CSV ou XLSX (mesmo que o nome esteja errado)
-LOOKUP_PATH = "data/Municipios.csv"
+# =========================================
+# Escolhe automaticamente o arquivo de lookup
+# (funciona mesmo se mudar maiúsculas/minúsculas)
+# =========================================
+LOOKUP_CANDIDATES = [
+    os.path.join(DATA_DIR, "Municipios.csv"),
+    os.path.join(DATA_DIR, "municipios.csv"),
+    os.path.join(DATA_DIR, "municipios_lookup.csv"),
+    os.path.join(DATA_DIR, "Municipios.xlsx"),
+    os.path.join(DATA_DIR, "municipios.xlsx"),
+]
+
+def _resolve_lookup_path() -> str:
+    for p in LOOKUP_CANDIDATES:
+        if os.path.exists(p):
+            return p
+    # mensagem rica para depurar no Render
+    raise RuntimeError(
+        "Nenhum arquivo de lookup encontrado em /data.\n"
+        f"Procurei: {LOOKUP_CANDIDATES}\n"
+        f"BASE_DIR={BASE_DIR}\n"
+        f"DATA_DIR={DATA_DIR}\n"
+        f"Arquivos em data/: {os.listdir(DATA_DIR) if os.path.isdir(DATA_DIR) else 'data/ não existe'}"
+    )
+
+LOOKUP_PATH = _resolve_lookup_path()
+
+# Cache para não reler arquivo toda hora
+_LOOKUP_CACHE = None
+_LOOKUP_MTIME = None
 
 
 def sanitizar_municipio(municipio: str, uf: str) -> str:
@@ -52,28 +85,7 @@ def _is_xlsx_file(path: str) -> bool:
         return False
 
 
-def _ler_texto_com_fallback(path: str) -> str:
-    with open(path, "rb") as f:
-        data = f.read()
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return data.decode("latin-1")
-
-
-def _detectar_delimitador(sample: str) -> str:
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t"])
-        return dialect.delimiter
-    except Exception:
-        header = sample.splitlines()[0] if sample.splitlines() else ""
-        if header.count(";") >= header.count(","):
-            return ";"
-        return ","
-
-
 def _get_lookup_from_excel(path: str) -> pd.DataFrame:
-    # lê a primeira aba por padrão
     df = pd.read_excel(path, dtype=str, engine="openpyxl")
     df.columns = [str(c).strip().upper() for c in df.columns]
 
@@ -88,83 +100,122 @@ def _get_lookup_from_excel(path: str) -> pd.DataFrame:
     return df
 
 
-def _get_lookup_from_csv(path: str) -> pd.DataFrame:
-    text = _ler_texto_com_fallback(path)
-    sample = "\n".join(text.splitlines()[:20])
-    delim = _detectar_delimitador(sample)
-
-    sio = StringIO(text)
-    reader = csv.reader(sio, delimiter=delim)
-
+def _detectar_delimitador(sample: str) -> str:
+    # tenta sniffer, se falhar escolhe por contagem
     try:
-        header = next(reader)
-    except StopIteration:
-        raise RuntimeError("CSV vazio.")
+        dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t"])
+        return dialect.delimiter
+    except Exception:
+        header = sample.splitlines()[0] if sample.splitlines() else ""
+        if header.count(";") >= header.count(","):
+            return ";"
+        return ","
 
-    header_norm = [h.strip().upper() for h in header]
 
-    def _idx(nome: str):
+def _get_lookup_from_csv(path: str) -> pd.DataFrame:
+    # IMPORTANTÍSSIMO: newline='' evita o erro "new-line character seen..."
+    # tenta utf-8, depois latin-1
+    last_err = None
+    for enc in ("utf-8", "latin-1"):
         try:
-            return header_norm.index(nome)
-        except ValueError:
-            return None
+            with open(path, "r", encoding=enc, newline="") as f:
+                # amostra para detectar delimitador
+                sample_lines = []
+                for _ in range(20):
+                    line = f.readline()
+                    if not line:
+                        break
+                    sample_lines.append(line)
+                sample = "".join(sample_lines)
 
-    idx_mun = _idx("NM_MUN")
-    idx_uf = _idx("SIGLA_UF")
+                # volta pro início para ler tudo
+                f.seek(0)
 
-    if idx_mun is None or idx_uf is None:
-        raise RuntimeError(f"CSV precisa ter colunas NM_MUN e SIGLA_UF. Cabeçalho: {header}")
+                delim = _detectar_delimitador(sample)
+                reader = csv.reader(f, delimiter=delim)
 
-    rows = []
-    for row in reader:
-        if not row:
-            continue
-        row = [c.strip() for c in row]
-        if len(row) < 2:
-            continue
+                header = next(reader, None)
+                if not header:
+                    raise RuntimeError("CSV vazio.")
 
-        # se linha veio com colunas extras, assume UF como último campo
-        if len(row) != len(header):
-            uf = row[-1]
-            mun = " ".join([c for c in row[:-1] if c]).strip()
-        else:
-            mun = row[idx_mun] if idx_mun < len(row) else ""
-            uf = row[idx_uf] if idx_uf < len(row) else ""
+                header_norm = [h.strip().upper() for h in header]
 
-        if not mun or not uf:
-            continue
+                def _idx(nome: str):
+                    try:
+                        return header_norm.index(nome)
+                    except ValueError:
+                        return None
 
-        uf = str(uf).strip().upper()
-        mun = str(mun).strip()
+                idx_mun = _idx("NM_MUN")
+                idx_uf = _idx("SIGLA_UF")
+                if idx_mun is None or idx_uf is None:
+                    raise RuntimeError(f"CSV precisa ter colunas NM_MUN e SIGLA_UF. Cabeçalho: {header}")
 
-        if len(uf) != 2:
-            continue
+                rows = []
+                for row in reader:
+                    if not row:
+                        continue
+                    row = [c.strip() for c in row]
+                    if len(row) < 2:
+                        continue
 
-        rows.append((uf, mun))
+                    # se vier com colunas extras: UF = último campo; município = resto juntado
+                    if len(row) != len(header):
+                        uf = row[-1]
+                        mun = " ".join([c for c in row[:-1] if c]).strip()
+                    else:
+                        mun = row[idx_mun] if idx_mun < len(row) else ""
+                        uf = row[idx_uf] if idx_uf < len(row) else ""
 
-    if not rows:
-        raise RuntimeError("Não consegui extrair nenhuma linha válida do arquivo (UF/Município).")
+                    if not mun or not uf:
+                        continue
 
-    df = pd.DataFrame(rows, columns=["SIGLA_UF", "NM_MUN"])
-    df["SIGLA_UF"] = df["SIGLA_UF"].astype(str).str.strip().str.upper()
-    df["NM_MUN"] = df["NM_MUN"].astype(str).str.strip()
-    df = df[(df["SIGLA_UF"] != "") & (df["NM_MUN"] != "")]
-    df = df.drop_duplicates(subset=["SIGLA_UF", "NM_MUN"])
-    return df
+                    uf = str(uf).strip().upper()
+                    mun = str(mun).strip()
+
+                    if len(uf) != 2:
+                        continue
+
+                    rows.append((uf, mun))
+
+                if not rows:
+                    raise RuntimeError("Não consegui extrair nenhuma linha válida do CSV (UF/Município).")
+
+                df = pd.DataFrame(rows, columns=["SIGLA_UF", "NM_MUN"])
+                df["SIGLA_UF"] = df["SIGLA_UF"].astype(str).str.strip().str.upper()
+                df["NM_MUN"] = df["NM_MUN"].astype(str).str.strip()
+                df = df[(df["SIGLA_UF"] != "") & (df["NM_MUN"] != "")]
+                df = df.drop_duplicates(subset=["SIGLA_UF", "NM_MUN"])
+                return df
+
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"Falha ao ler CSV ({path}). Último erro: {last_err}")
 
 
 def get_lookup() -> pd.DataFrame:
-    if not os.path.exists(LOOKUP_PATH):
-        raise RuntimeError(f"Arquivo não encontrado: {LOOKUP_PATH}")
+    global _LOOKUP_CACHE, _LOOKUP_MTIME
 
-    # Se for XLSX (mesmo que o nome esteja .csv), lê como Excel
-    if _is_xlsx_file(LOOKUP_PATH):
-        return _get_lookup_from_excel(LOOKUP_PATH)
+    path = LOOKUP_PATH
+    mtime = os.path.getmtime(path)
 
-    # senão tenta como CSV
-    return _get_lookup_from_csv(LOOKUP_PATH)
+    if _LOOKUP_CACHE is not None and _LOOKUP_MTIME == mtime:
+        return _LOOKUP_CACHE
+
+    if _is_xlsx_file(path) or path.lower().endswith(".xlsx"):
+        df = _get_lookup_from_excel(path)
+    else:
+        df = _get_lookup_from_csv(path)
+
+    _LOOKUP_CACHE = df
+    _LOOKUP_MTIME = mtime
+    return df
 
 
+# =========================================
+# Rotas auxiliares
+# =========================================
 @app.get("/health", include_in_schema=False)
 async def health():
     return PlainTextResponse("ok", status_code=200)
@@ -177,15 +228,19 @@ async def head_root():
 
 @app.get("/processar", include_in_schema=False)
 async def processar_get():
+    # evita erro se alguém abrir /processar na URL
     return RedirectResponse(url="/", status_code=302)
 
 
+# =========================================
+# UI
+# =========================================
 @app.get("/")
 async def home(request: Request):
     try:
         df = get_lookup()
     except Exception as e:
-        return PlainTextResponse(f"Erro carregando Municipios.csv: {e}", status_code=500)
+        return PlainTextResponse(f"Erro carregando lookup: {e}", status_code=500)
 
     ufs = sorted(df["SIGLA_UF"].dropna().unique().tolist())
     return templates.TemplateResponse("index.html", {"request": request, "ufs": ufs})
@@ -204,6 +259,9 @@ async def listar_municipios(uf: str):
     return municipios
 
 
+# =========================================
+# Processamento
+# =========================================
 @app.post("/processar")
 async def cortar(
     arquivo: UploadFile = File(...),
@@ -275,5 +333,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-
