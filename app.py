@@ -1,16 +1,20 @@
-@app.get("/")
-def home():
-return {"status": "API Cortador de Pranchas funcionando"}
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse
 import shutil
 import uuid
 import os
 
-# IMPORTA DO SEU SCRIPT REAL
+# IMPORTA O PROCESSADOR
 from cortarpontos import processar
 
+
 app = FastAPI()
+
+
+@app.get("/")
+def home():
+    return {"status": "API Cortador de Pranchas funcionando"}
+
 
 UPLOAD = "uploads"
 OUTPUT = "outputs"
@@ -29,29 +33,15 @@ async def cortar(
 
     uid = str(uuid.uuid4())
 
-    # salvar upload
-    shp_path = os.path.join(UPLOAD, f"{uid}.shp")
+    shp_path = os.path.join(UPLOAD, uid + ".shp")
 
-    with open(shp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    with open(shp_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
 
-    # pasta de saída
     out_dir = os.path.join(OUTPUT, uid)
-    os.makedirs(out_dir, exist_ok=True)
 
-    # chama seu algoritmo
-    zip_path = processar(
-        shp_path,
-        uf,
-        municipio,
-        cap,
-        out_dir
-    )
+    os.makedirs(out_dir)
 
-    # retorna download
-    return FileResponse(
-        zip_path,
-        filename="resultado.zip",
-        media_type="application/zip"
-    )
+    zip_path = processar(shp_path, uf, municipio, cap, out_dir)
 
+    return FileResponse(zip_path, filename="resultado.zip")
