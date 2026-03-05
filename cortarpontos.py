@@ -30,6 +30,7 @@ def _safe_unary_union(geoms):
 # ---------------------------------------------------
 
 def _part1by1(n):
+    n = int(n) & 0xFFFFFFFF
     n = (n | (n << 8)) & 0x00FF00FF
     n = (n | (n << 4)) & 0x0F0F0F0F
     n = (n | (n << 2)) & 0x33333333
@@ -51,13 +52,15 @@ def spatial_sort(gdf):
     xmin, xmax = xs.min(), xs.max()
     ymin, ymax = ys.min(), ys.max()
 
-    dx = xmax - xmin if xmax != xmin else 1
-    dy = ymax - ymin if ymax != ymin else 1
+    dx = (xmax - xmin) if xmax != xmin else 1.0
+    dy = (ymax - ymin) if ymax != ymin else 1.0
 
     x_norm = ((xs - xmin) / dx * 65535).astype(int)
     y_norm = ((ys - ymin) / dy * 65535).astype(int)
 
-    g["__morton"] = morton_code(x_norm, y_norm)
+    g["__morton"] = [
+        morton_code(int(x), int(y)) for x, y in zip(x_norm, y_norm)
+    ]
 
     g = g.sort_values("__morton").drop(columns="__morton")
 
@@ -65,7 +68,7 @@ def spatial_sort(gdf):
 
 
 # ---------------------------------------------------
-# carregar municípios (AGORA GEOJSON)
+# carregar municípios
 # ---------------------------------------------------
 
 def load_municipios():
@@ -77,14 +80,11 @@ def load_municipios():
 
     mun = gpd.read_file(path)
 
-    # normalizar nomes
     mun.columns = [c.upper() for c in mun.columns]
 
-    # garantir coluna de geometria
     if "GEOMETRY" in mun.columns:
         mun = mun.set_geometry("GEOMETRY")
 
-    # garantir CRS
     if mun.crs is None:
         mun = mun.set_crs(4674)
 
@@ -92,7 +92,7 @@ def load_municipios():
 
 
 # ---------------------------------------------------
-# descobrir colunas UF / MUNICIPIO
+# detectar colunas
 # ---------------------------------------------------
 
 def detect_columns(mun):
@@ -109,20 +109,20 @@ def detect_columns(mun):
             mun_col = c
 
     if uf_col is None or mun_col is None:
-        raise ValueError("Não foi possível detectar colunas de UF ou Município no GeoJSON")
+        raise ValueError("Não foi possível detectar colunas de UF ou Município")
 
     return uf_col, mun_col
 
 
 # ---------------------------------------------------
-# guess UTM
+# guess utm
 # ---------------------------------------------------
 
 def guess_utm(gdf):
 
     g = gdf.to_crs(4326)
 
-    centroid = g.unary_union.centroid
+    centroid = g.geometry.unary_union.centroid
 
     lon = centroid.x
     lat = centroid.y
@@ -135,7 +135,7 @@ def guess_utm(gdf):
 
 
 # ---------------------------------------------------
-# grupos fixos
+# grupos
 # ---------------------------------------------------
 
 def assign_groups(gdf, cap):
@@ -148,7 +148,7 @@ def assign_groups(gdf, cap):
 
 
 # ---------------------------------------------------
-# construir células Voronoi
+# voronoi
 # ---------------------------------------------------
 
 def build_cells(points, boundary):
@@ -170,7 +170,7 @@ def build_cells(points, boundary):
 
 
 # ---------------------------------------------------
-# dissolve células por grupo
+# dissolve
 # ---------------------------------------------------
 
 def dissolve_por_grupo(points, cells):
@@ -213,7 +213,7 @@ def dissolve_por_grupo(points, cells):
 
 
 # ---------------------------------------------------
-# export excel
+# excel
 # ---------------------------------------------------
 
 def export_excel(points, out):
@@ -235,7 +235,7 @@ def export_excel(points, out):
 
 
 # ---------------------------------------------------
-# export kmz
+# kmz
 # ---------------------------------------------------
 
 def export_kmz(points, cell, municipio, path):
@@ -261,7 +261,7 @@ def export_kmz(points, cell, municipio, path):
 
 
 # ---------------------------------------------------
-# pipeline principal
+# pipeline
 # ---------------------------------------------------
 
 def processar(shp_path, uf, municipio, cap, out_dir):
@@ -277,7 +277,7 @@ def processar(shp_path, uf, municipio, cap, out_dir):
     mun_geom = mun[
         (mun[uf_col] == uf) &
         (mun[mun_col].str.upper() == municipio.upper())
-   ].geometry.iloc[0]
+    ].geometry.iloc[0]
 
     gdf = gdf[
         gdf.geometry.within(mun_geom) |
