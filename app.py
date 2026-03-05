@@ -29,9 +29,13 @@ BASE = gpd.read_file("data/Municipios.geojson")
 
 BASE.columns = [c.upper() for c in BASE.columns]
 
+# ativar geometria
+if "GEOMETRY" in BASE.columns:
+    BASE = BASE.set_geometry("GEOMETRY")
+
+# garantir CRS
 if BASE.crs is None:
     BASE = BASE.set_crs(4674)
-
 
 # ---------------------------
 # HOME
@@ -108,3 +112,4 @@ async def cortar(
     resultado = processar(shp_path, uf, municipio, cap, out_dir)
 
     return FileResponse(resultado, filename="resultado.zip")
+
