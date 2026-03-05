@@ -6,7 +6,7 @@ import zipfile
 import geopandas as gpd
 
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 # Importa a função processar do seu arquivo cortarpontos.py
@@ -21,13 +21,13 @@ OUTPUT_DIR = "outputs"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+MUNICIPIOS_PATH = "data/Municipios.geojson"
+
 
 # ---------------------------------------------------
-# Normalização robusta do município recebido do FORM
+# Sanitização robusta do município recebido do FORM
 # (corrige casos tipo "Maurilândia-GO", "Maurilândia / GO", "Maurilândia (GO)")
 # ---------------------------------------------------
-_UF_RX = re.compile(r"\b[A-Z]{2}\b", re.IGNORECASE)
-
 def sanitizar_municipio(municipio: str, uf: str) -> str:
     if municipio is None:
         return ""
@@ -52,16 +52,15 @@ def sanitizar_municipio(municipio: str, uf: str) -> str:
 
 
 # ---------------------------------------------------
-# Carregar base de dados (Singleton)
+# Carregar base de dados (Singleton) para listagem
 # ---------------------------------------------------
 def carregar_base():
-    path = "data/Municipios.geojson"
-    if not os.path.exists(path):
-        print(f"ERRO CRÍTICO: Arquivo {path} não encontrado!")
+    if not os.path.exists(MUNICIPIOS_PATH):
+        print(f"ERRO CRÍTICO: Arquivo {MUNICIPIOS_PATH} não encontrado!")
         return None
 
     try:
-        df = gpd.read_file(path)
+        df = gpd.read_file(MUNICIPIOS_PATH)
         df.columns = [c.upper() for c in df.columns]
 
         if "GEOMETRY" in df.columns:
@@ -70,12 +69,10 @@ def carregar_base():
         if df.crs is None:
             df = df.set_crs(4674)
 
-        # Garantias mínimas
         if "SIGLA_UF" not in df.columns or "NM_MUN" not in df.columns:
             print(f"ERRO CRÍTICO: Colunas esperadas não encontradas. Colunas: {list(df.columns)}")
             return None
 
-        # limpeza leve para listagem
         df["SIGLA_UF"] = df["SIGLA_UF"].astype(str).str.strip().str.upper()
         df["NM_MUN"] = df["NM_MUN"].astype(str).str.strip()
 
@@ -89,13 +86,21 @@ BASE = carregar_base()
 
 
 # ---------------------------------------------------
+# Handler global: evita "Erro interno" genérico sem contexto
+# ---------------------------------------------------
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    # Se já for HTTPException, FastAPI cuida. Aqui é "fallback" para exceções não tratadas.
+    return JSONResponse(status_code=500, content={"detail": f"Erro interno: {str(exc)}"})
+
+
+# ---------------------------------------------------
 # Rotas
 # ---------------------------------------------------
 @app.get("/")
 async def home(request: Request):
     if BASE is None:
         return "Erro: Base de dados de municípios não carregada no servidor."
-
     ufs = sorted([u for u in BASE["SIGLA_UF"].dropna().unique() if str(u).strip()])
     return templates.TemplateResponse("index.html", {"request": request, "ufs": ufs})
 
@@ -122,16 +127,26 @@ async def cortar(
     extract_dir = os.path.join(UPLOAD_DIR, uid)
     out_dir = os.path.join(OUTPUT_DIR, uid)
 
-    # normaliza UF e MUNICIPIO para evitar o bug do "-GO" vindo no form
     uf_norm = (uf or "").strip().upper()
     municipio_norm = sanitizar_municipio(municipio, uf_norm)
+
+    temp_zip = os.path.join(UPLOAD_DIR, f"{uid}.zip")
+    shp_path = None
 
     try:
         os.makedirs(extract_dir, exist_ok=True)
         os.makedirs(out_dir, exist_ok=True)
 
+        # validações rápidas
+        if not uf_norm or len(uf_norm) != 2:
+            raise ValueError("UF inválida. Selecione uma UF válida.")
+        if not municipio_norm:
+            raise ValueError("Município inválido. Selecione um município válido.")
+        cap = int(cap)
+        if cap <= 0:
+            raise ValueError("Postes por prancha (cap) deve ser maior que zero.")
+
         # 1) salvar ZIP
-        temp_zip = os.path.join(UPLOAD_DIR, f"{uid}.zip")
         with open(temp_zip, "wb") as f:
             shutil.copyfileobj(arquivo.file, f)
 
@@ -139,8 +154,7 @@ async def cortar(
         with zipfile.ZipFile(temp_zip, "r") as zip_ref:
             zip_ref.extractall(extract_dir)
 
-        # 3) achar .shp
-        shp_path = None
+        # 3) achar .shp (primeiro .shp encontrado)
         for root, _, files in os.walk(extract_dir):
             for file in files:
                 if file.lower().endswith(".shp"):
@@ -152,8 +166,8 @@ async def cortar(
         if not shp_path:
             raise ValueError("Arquivo .shp não encontrado dentro do ZIP enviado.")
 
-        # 4) processar
-        resultado_zip = processar(shp_path, uf_norm, municipio_norm, int(cap), out_dir)
+        # 4) processar (cortarpontos.py agora também sanitiza e normaliza corretamente)
+        resultado_zip = processar(shp_path, uf_norm, municipio_norm, cap, out_dir)
 
         # 5) retorno
         safe_name = re.sub(r"[^A-Za-z0-9_\-]+", "_", municipio_norm).strip("_") or "resultado"
@@ -165,13 +179,24 @@ async def cortar(
 
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
     finally:
-        # limpeza opcional (deixe comentado se quiser inspecionar outputs no servidor)
-        # shutil.rmtree(extract_dir, ignore_errors=True)
-        # if os.path.exists(temp_zip): os.remove(temp_zip)
-        pass
+        # Limpeza para não lotar o Render (recomendado em produção)
+        try:
+            if os.path.exists(temp_zip):
+                os.remove(temp_zip)
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        except Exception:
+            pass
+        # Se quiser manter outputs para debug, comente a linha abaixo.
+        # Em produção, recomendo limpar depois de servir o zip.
+        # shutil.rmtree(out_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
