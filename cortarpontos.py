@@ -1,4 +1,5 @@
 import os
+import re
 import zipfile
 import numpy as np
 import pandas as pd
@@ -11,37 +12,74 @@ from shapely.ops import unary_union, voronoi_diagram
 from shapely.validation import make_valid
 from pyproj import CRS
 
-# ---------------------------------------------------
+# ===================================================
 # Helpers de Normalização e Geometria
-# ---------------------------------------------------
+# ===================================================
 
 def _is_geom(g):
-    return g is not None and not g.is_empty
+    return g is not None and (not getattr(g, "is_empty", True))
 
 def _limpar_geometria(g):
-    """Corrige problemas comuns de topologia em Shapefiles."""
+    """Corrige problemas comuns de topologia."""
     if not _is_geom(g):
         return None
-    if not g.is_valid:
-        g = make_valid(g)
-    return g.buffer(0)
+    try:
+        if not g.is_valid:
+            g = make_valid(g)
+        # buffer(0) resolve muitos self-intersections
+        g = g.buffer(0)
+    except Exception:
+        # se der ruim, tenta retornar como está
+        pass
+    return g
 
 def _safe_unary_union(geoms):
     geoms = [_limpar_geometria(g) for g in geoms if _is_geom(g)]
     if not geoms:
         return None
-    return unary_union(geoms).buffer(0)
+    u = unary_union(geoms)
+    return _limpar_geometria(u)
 
 def remover_acentos(txt):
-    """Normaliza strings para comparação (remove acentos e espaços extras)."""
+    """Remove acentos + normaliza para comparação."""
+    if txt is None:
+        return ""
     if not isinstance(txt, str):
-        return str(txt).upper().strip()
-    return "".join(c for c in unicodedata.normalize('NFD', txt)
-                   if unicodedata.category(c) != 'Mn').upper().strip()
+        txt = str(txt)
+    txt = txt.replace("\u00A0", " ")  # NBSP
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return "".join(
+        c for c in unicodedata.normalize("NFD", txt)
+        if unicodedata.category(c) != "Mn"
+    ).upper().strip()
 
-# ---------------------------------------------------
+def sanitizar_municipio(municipio: str, uf: str) -> str:
+    """
+    Remove UF embutida no nome (ex: 'Maurilândia-GO', 'Maurilândia / GO', 'Maurilândia (GO)').
+    Mantém só o nome do município.
+    """
+    s = "" if municipio is None else str(municipio).strip()
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    uf2 = (uf or "").strip().upper()
+    if not uf2:
+        return s
+
+    # remove sufixos comuns no final
+    s = re.sub(rf"(\s*[-/]\s*{re.escape(uf2)})\s*$", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(rf"\(\s*{re.escape(uf2)}\s*\)\s*$", "", s, flags=re.IGNORECASE).strip()
+
+    # remove UF solta no final
+    if s.upper().endswith(" " + uf2):
+        s = s[: -(len(uf2) + 1)].strip()
+
+    return s
+
+
+# ===================================================
 # Morton Spatial Sort (Z-Order Curve)
-# ---------------------------------------------------
+# ===================================================
 
 def _part1by1(n):
     n = int(n) & 0xFFFFFFFF
@@ -58,8 +96,9 @@ def spatial_sort(gdf):
     if len(gdf) == 0:
         return gdf
     g = gdf.copy()
-    xs = g.geometry.centroid.x
-    ys = g.geometry.centroid.y
+    cent = g.geometry.centroid
+    xs = cent.x
+    ys = cent.y
 
     xmin, xmax = xs.min(), xs.max()
     ymin, ymax = ys.min(), ys.max()
@@ -74,9 +113,10 @@ def spatial_sort(gdf):
     g = g.sort_values("__morton").drop(columns="__morton")
     return g.reset_index(drop=True)
 
-# ---------------------------------------------------
-# Funções de Dados e UTM
-# ---------------------------------------------------
+
+# ===================================================
+# Dados de Municípios e UTM
+# ===================================================
 
 def load_municipios():
     path = "data/Municipios.geojson"
@@ -84,19 +124,22 @@ def load_municipios():
         raise FileNotFoundError(f"Arquivo não encontrado: {path}")
     mun = gpd.read_file(path)
     mun.columns = [c.upper() for c in mun.columns]
+
     if "GEOMETRY" in mun.columns:
         mun = mun.set_geometry("GEOMETRY")
+
     if mun.crs is None:
         mun = mun.set_crs(4674)
+
     return mun
 
 def detect_columns(mun):
     cols = list(mun.columns)
     uf_col = "SIGLA_UF" if "SIGLA_UF" in cols else next((c for c in cols if "UF" in c), None)
     mun_col = "NM_MUN" if "NM_MUN" in cols else next((c for c in cols if "MUN" in c or "NOME" in c), None)
-    
+
     if not uf_col or not mun_col:
-        raise ValueError("Não foi possível detectar colunas de UF ou Município.")
+        raise ValueError(f"Não foi possível detectar colunas UF/Município. Colunas: {cols}")
     return uf_col, mun_col
 
 def guess_utm(gdf):
@@ -107,35 +150,38 @@ def guess_utm(gdf):
     epsg = 32700 + zone if lat < 0 else 32600 + zone
     return CRS.from_epsg(epsg)
 
-# ---------------------------------------------------
-# Processamento de Grupos e Voronoi
-# ---------------------------------------------------
+
+# ===================================================
+# Voronoi / Dissolve por grupo
+# ===================================================
 
 def build_cells(points, boundary):
     boundary = _limpar_geometria(boundary)
+    if boundary is None:
+        return []
+
     mp = MultiPoint(list(points.geometry))
     vd = voronoi_diagram(mp, envelope=boundary)
+
     cells = []
     for c in vd.geoms:
-        intersected = c.intersection(boundary)
-        if _is_geom(intersected):
-            cells.append(_limpar_geometria(intersected))
-    return cells
+        inter = c.intersection(boundary)
+        if _is_geom(inter):
+            cells.append(_limpar_geometria(inter))
+    return [c for c in cells if _is_geom(c)]
 
 def dissolve_por_grupo(points, cells):
-    cells_gdf = gpd.GeoDataFrame(
-        {"cell_id": range(len(cells))},
-        geometry=cells,
-        crs=points.crs
-    )
+    if not cells:
+        # fallback: sem células, retorna lista de None no tamanho dos grupos
+        max_gid = int(points["__gid"].max()) if len(points) else -1
+        return [None] * (max_gid + 1)
 
-    # Limpeza preventiva de geometrias nulas nos pontos
+    cells_gdf = gpd.GeoDataFrame({"cell_id": range(len(cells))}, geometry=cells, crs=points.crs)
+
     points = points[points.geometry.notnull()].copy()
-
-    # Join INNER garante que células sem pontos ou pontos fora de células sejam ignorados
     join = gpd.sjoin(points[["__gid", "geometry"]], cells_gdf, how="inner", predicate="within")
 
-    geom_map = cells_gdf['geometry'].to_dict()
+    geom_map = cells_gdf["geometry"].to_dict()
     grupos_geoms = join.groupby("__gid")["cell_id"].unique().to_dict()
 
     max_gid = int(points["__gid"].max())
@@ -148,9 +194,10 @@ def dissolve_por_grupo(points, cells):
 
     return dissolvidos
 
-# ---------------------------------------------------
+
+# ===================================================
 # Exportação
-# ---------------------------------------------------
+# ===================================================
 
 def export_excel(points_wgs, out_path):
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
@@ -159,7 +206,7 @@ def export_excel(points_wgs, out_path):
             df = pd.DataFrame(g.drop(columns="geometry"))
             df["LON"] = g.geometry.x
             df["LAT"] = g.geometry.y
-            df.to_excel(writer, sheet_name=f"Prancha {int(gid)+1}", index=False)
+            df.to_excel(writer, sheet_name=f"Prancha {int(gid) + 1}", index=False)
 
 def export_kmz(points_wgs, cell_wgs, path):
     kml = simplekml.Kml()
@@ -170,74 +217,94 @@ def export_kmz(points_wgs, cell_wgs, path):
         p.coords = [(r.geometry.x, r.geometry.y)]
 
     if cell_wgs and _is_geom(cell_wgs):
-        if cell_wgs.geom_type == 'Polygon':
+        if cell_wgs.geom_type == "Polygon":
             pol = fol.newpolygon(name="Limite da Prancha")
             pol.outerboundaryis = list(cell_wgs.exterior.coords)
-        elif cell_wgs.geom_type == 'MultiPolygon':
+        elif cell_wgs.geom_type == "MultiPolygon":
             for i, part in enumerate(cell_wgs.geoms):
                 pol = fol.newpolygon(name=f"Parte {i}")
                 pol.outerboundaryis = list(part.exterior.coords)
 
     kml.savekmz(path)
 
-# ---------------------------------------------------
+
+# ===================================================
 # Pipeline Principal
-# ---------------------------------------------------
+# ===================================================
 
 def processar(shp_path, uf, municipio, cap, out_dir):
+    # --- Normaliza entrada (corrige "Maurilândia-GO") ---
+    uf_alvo = (uf or "").strip().upper()
+    municipio_limpo = sanitizar_municipio(municipio, uf_alvo)
+
     mun = load_municipios()
     uf_col, mun_col = detect_columns(mun)
-    
-    # Busca Robusta: normaliza entrada e base
-    uf_alvo = uf.strip().upper()
-    mun_alvo = remover_acentos(municipio)
-    mun["__NORM"] = mun[mun_col].apply(remover_acentos)
-    
-    selecao = mun[(mun[uf_col].str.strip().upper() == uf_alvo) & (mun["__NORM"] == mun_alvo)]
-    
-    if selecao.empty:
-        opcoes = list(mun[mun[uf_col] == uf_alvo][mun_col].unique()[:5])
-        raise ValueError(f"Município '{municipio}' não encontrado em {uf}. Sugestões: {opcoes}")
-    
-    mun_geom_orig = _limpar_geometria(selecao.geometry.iloc[0])
 
+    # --- Normaliza base ---
+    mun[uf_col] = mun[uf_col].astype(str).str.strip().str.upper()
+    mun["__NORM"] = mun[mun_col].apply(remover_acentos)
+
+    mun_alvo = remover_acentos(municipio_limpo)
+
+    selecao = mun[(mun[uf_col] == uf_alvo) & (mun["__NORM"] == mun_alvo)]
+
+    if selecao.empty:
+        # sugestões mais úteis (já normalizadas)
+        sub = mun[mun[uf_col] == uf_alvo].copy()
+        opcoes = list(sub[mun_col].dropna().unique()[:10])
+        raise ValueError(f"Município '{municipio}' (normalizado para '{municipio_limpo}') não encontrado em {uf_alvo}. Sugestões: {opcoes}")
+
+    mun_geom_orig = _limpar_geometria(selecao.geometry.iloc[0])
+    if mun_geom_orig is None:
+        raise ValueError("Geometria do município inválida/nula na base.")
+
+    # --- Ler pontos ---
     gdf = gpd.read_file(shp_path)
     gdf = gdf[gdf.geometry.notnull()].copy()
-    if gdf.crs != mun.crs:
+
+    # CRS: tenta harmonizar
+    if gdf.crs is None:
+        # se o shapefile vier sem CRS, assume o mesmo da base (melhor do que quebrar)
+        gdf = gdf.set_crs(mun.crs)
+    elif gdf.crs != mun.crs:
         gdf = gdf.to_crs(mun.crs)
-        
+
+    # filtra pontos no município
     gdf = gdf[gdf.intersects(mun_geom_orig)].copy()
     if len(gdf) == 0:
         raise ValueError("Nenhum ponto encontrado dentro dos limites do município.")
 
+    # --- Processamento ---
     utm_crs = guess_utm(gdf)
     gdf_utm = gdf.to_crs(utm_crs)
     mun_geom_utm = gpd.GeoSeries([mun_geom_orig], crs=mun.crs).to_crs(utm_crs).iloc[0]
 
     gdf_utm = spatial_sort(gdf_utm)
+    cap = int(cap) if int(cap) > 0 else 200
     gdf_utm["__gid"] = np.arange(len(gdf_utm)) // cap
 
     cells_utm = build_cells(gdf_utm, mun_geom_utm)
     grupos_utm = dissolve_por_grupo(gdf_utm, cells_utm)
 
+    # --- Exportações ---
     gdf_wgs = gdf_utm.to_crs(4326)
     os.makedirs(out_dir, exist_ok=True)
-    
+
     excel_path = os.path.join(out_dir, "pranchas.xlsx")
     export_excel(gdf_wgs, excel_path)
 
     kmz_dir = os.path.join(out_dir, "kmz")
     os.makedirs(kmz_dir, exist_ok=True)
-    
+
     max_gid = int(gdf_utm["__gid"].max())
     for gid in range(max_gid + 1):
         pts_prancha = gdf_wgs[gdf_wgs["__gid"] == gid]
-        cell_utm = grupos_utm[gid]
+        cell_utm = grupos_utm[gid] if gid < len(grupos_utm) else None
         cell_wgs = None
         if cell_utm:
             cell_wgs = gpd.GeoSeries([cell_utm], crs=utm_crs).to_crs(4326).iloc[0]
-        
-        kmz_path = os.path.join(kmz_dir, f"prancha_{gid+1}.kmz")
+
+        kmz_path = os.path.join(kmz_dir, f"prancha_{gid + 1}.kmz")
         export_kmz(pts_prancha, cell_wgs, kmz_path)
 
     zip_path = os.path.join(out_dir, "resultado.zip")
