@@ -41,19 +41,48 @@ def sanitizar_municipio(municipio: str, uf: str) -> str:
 
 
 def get_lookup() -> pd.DataFrame:
+    """
+    Leitura robusta do CSV:
+    - tenta utf-8 e depois latin-1 (Excel/Windows-1252)
+    - tenta separador ',' e depois ';'
+    - usa engine='python' e on_bad_lines='skip' para pular linhas quebradas
+    """
     if not os.path.exists(LOOKUP_PATH):
         raise RuntimeError(f"Arquivo não encontrado: {LOOKUP_PATH}")
 
-    # tenta utf-8, se falhar usa latin-1 (Excel/Windows-1252)
-    try:
-        df = pd.read_csv(LOOKUP_PATH, dtype=str, encoding="utf-8")
-    except UnicodeDecodeError:
-        df = pd.read_csv(LOOKUP_PATH, dtype=str, encoding="latin-1")
+    encodings = ["utf-8", "latin-1"]
+    seps = [",", ";"]
+
+    last_err = None
+    df = None
+
+    for enc in encodings:
+        for sep in seps:
+            try:
+                df = pd.read_csv(
+                    LOOKUP_PATH,
+                    dtype=str,
+                    encoding=enc,
+                    sep=sep,
+                    engine="python",
+                    on_bad_lines="skip",
+                )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+        if df is not None:
+            break
+
+    if df is None:
+        raise RuntimeError(f"Falha ao ler CSV: {last_err}")
 
     # garante colunas esperadas (aceita variações de maiúsculas/minúsculas)
     cols = {c.strip().upper(): c for c in df.columns}
     if "SIGLA_UF" not in cols or "NM_MUN" not in cols:
-        raise RuntimeError(f"CSV precisa ter colunas NM_MUN e SIGLA_UF. Colunas: {list(df.columns)}")
+        raise RuntimeError(
+            f"CSV precisa ter colunas NM_MUN e SIGLA_UF. Colunas encontradas: {list(df.columns)}"
+        )
 
     # padroniza nomes
     df = df.rename(columns={cols["SIGLA_UF"]: "SIGLA_UF", cols["NM_MUN"]: "NM_MUN"})
