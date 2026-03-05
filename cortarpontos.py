@@ -77,13 +77,17 @@ def load_municipios():
 
     mun = gpd.read_file(path)
 
-    if mun.crs is None:
-        mun = mun.set_crs(4674)
+# normalizar nomes
+mun.columns = [c.upper() for c in mun.columns]
 
-    # normalizar nomes
-    mun.columns = [c.upper() for c in mun.columns]
+# garantir coluna de geometria
+if "GEOMETRY" in mun.columns:
+    mun = mun.set_geometry("GEOMETRY")
 
-    return mun
+if mun.crs is None:
+    mun = mun.set_crs(4674)
+
+return mun
 
 
 # ---------------------------------------------------
@@ -272,7 +276,7 @@ def processar(shp_path, uf, municipio, cap, out_dir):
     mun_geom = mun[
         (mun[uf_col] == uf) &
         (mun[mun_col].str.upper() == municipio.upper())
-    ].geometry.iloc[0]
+   ]["GEOMETRY"].iloc[0]
 
     gdf = gdf[
         gdf.geometry.within(mun_geom) |
