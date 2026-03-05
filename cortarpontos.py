@@ -77,17 +77,18 @@ def load_municipios():
 
     mun = gpd.read_file(path)
 
-# normalizar nomes
-mun.columns = [c.upper() for c in mun.columns]
+    # normalizar nomes
+    mun.columns = [c.upper() for c in mun.columns]
 
-# garantir coluna de geometria
-if "GEOMETRY" in mun.columns:
-    mun = mun.set_geometry("GEOMETRY")
+    # garantir coluna de geometria
+    if "GEOMETRY" in mun.columns:
+        mun = mun.set_geometry("GEOMETRY")
 
-if mun.crs is None:
-    mun = mun.set_crs(4674)
+    # garantir CRS
+    if mun.crs is None:
+        mun = mun.set_crs(4674)
 
-return mun
+    return mun
 
 
 # ---------------------------------------------------
