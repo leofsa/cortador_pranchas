@@ -6,7 +6,7 @@ import zipfile
 import pandas as pd
 
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from cortarpontos import processar
@@ -44,20 +44,26 @@ def get_lookup() -> pd.DataFrame:
     if not os.path.exists(LOOKUP_PATH):
         raise RuntimeError(f"Arquivo não encontrado: {LOOKUP_PATH}")
 
-    df = pd.read_csv(LOOKUP_PATH, dtype=str)
-    # garante colunas esperadas
+    # tenta utf-8, se falhar usa latin-1 (Excel/Windows-1252)
+    try:
+        df = pd.read_csv(LOOKUP_PATH, dtype=str, encoding="utf-8")
+    except UnicodeDecodeError:
+        df = pd.read_csv(LOOKUP_PATH, dtype=str, encoding="latin-1")
+
+    # garante colunas esperadas (aceita variações de maiúsculas/minúsculas)
     cols = {c.strip().upper(): c for c in df.columns}
     if "SIGLA_UF" not in cols or "NM_MUN" not in cols:
         raise RuntimeError(f"CSV precisa ter colunas NM_MUN e SIGLA_UF. Colunas: {list(df.columns)}")
 
-    # padroniza nomes (caso venham com variações)
+    # padroniza nomes
     df = df.rename(columns={cols["SIGLA_UF"]: "SIGLA_UF", cols["NM_MUN"]: "NM_MUN"})
 
     df["SIGLA_UF"] = df["SIGLA_UF"].astype(str).str.strip().str.upper()
     df["NM_MUN"] = df["NM_MUN"].astype(str).str.strip()
 
-    # remove vazios
+    # remove vazios + dupes
     df = df[(df["SIGLA_UF"] != "") & (df["NM_MUN"] != "")]
+    df = df.drop_duplicates(subset=["SIGLA_UF", "NM_MUN"])
     return df
 
 
@@ -69,6 +75,12 @@ async def health():
 @app.head("/", include_in_schema=False)
 async def head_root():
     return PlainTextResponse("", status_code=200)
+
+
+# evita erro quando a pessoa abre /processar no navegador (GET)
+@app.get("/processar", include_in_schema=False)
+async def processar_get():
+    return RedirectResponse(url="/", status_code=302)
 
 
 @app.get("/")
@@ -128,7 +140,7 @@ async def cortar(
         with zipfile.ZipFile(temp_zip, "r") as zip_ref:
             zip_ref.extractall(extract_dir)
 
-        # acha shp
+        # acha .shp
         for root, _, files in os.walk(extract_dir):
             for file in files:
                 if file.lower().endswith(".shp"):
@@ -140,7 +152,7 @@ async def cortar(
         if not shp_path:
             raise ValueError("Arquivo .shp não encontrado dentro do ZIP enviado.")
 
-        # processa (a geometria do município continua sendo lida do GeoJSON dentro do cortarpontos.py)
+        # processa (polígono continua vindo do Municipios.geojson no cortarpontos.py)
         resultado_zip = processar(shp_path, uf_norm, municipio_norm, cap, out_dir)
 
         safe_name = re.sub(r"[^A-Za-z0-9_\-]+", "_", municipio_norm).strip("_") or "resultado"
@@ -165,11 +177,12 @@ async def cortar(
             shutil.rmtree(extract_dir, ignore_errors=True)
         except Exception:
             pass
-        # out_dir: se quiser limpar depois, descomente
+        # se quiser limpar outputs também (atenção: não apague antes do download terminar)
         # shutil.rmtree(out_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
